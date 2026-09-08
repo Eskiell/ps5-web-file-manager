@@ -16,6 +16,7 @@ typedef enum task_op {
   TASK_CHMOD,
   TASK_DOWNLOAD,
   TASK_UPLOAD,
+  TASK_EXTRACT,
   TASK_PKG_INSTALL,
 } task_op_t;
 
@@ -44,11 +45,15 @@ typedef struct file_task {
   char error_arg[PATH_MAX + 96];
   char **srcs;
   size_t src_count;
+  char *password;
+  char **extract_destinations;
+  int extract_attached;
   size_t file_count;
   size_t dir_count;
   size_t upload_completed;
   unsigned int chmod_mode;
   int recursive;
+  int extract_overwrite;
   unsigned long long total;
   unsigned long long done;
   unsigned long long speed;

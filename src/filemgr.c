@@ -21,6 +21,8 @@
 #endif
 
 #include "filemgr_internal.h"
+#include "archive_extract.h"
+#include "archive_helper.h"
 #include "json_util.h"
 #include "path_util.h"
 #include "pkg_info.h"
@@ -157,7 +159,8 @@ static int g_pkg_worker_started;
 
 void
 record_task_completion_locked(file_task_t *task, time_t completed_at) {
-  if((task->op == TASK_COPY || task->op == TASK_MOVE || task->op == TASK_UPLOAD) &&
+  if((task->op == TASK_COPY || task->op == TASK_MOVE ||
+      task->op == TASK_UPLOAD || task->op == TASK_EXTRACT) &&
      completed_at - task->created_at >= TRANSFER_ALERT_THRESHOLD) {
     g_last_completion.id = task->id;
     g_last_completion.op = task->op;
@@ -1627,6 +1630,90 @@ task_request_error(struct MHD_Connection *conn, file_task_t *task,
   return send_json_error(conn, status, msg);
 }
 
+typedef struct extract_progress_context {
+  file_task_t *task;
+  unsigned long long last_done;
+} extract_progress_context_t;
+
+static int
+extract_cancel_requested(void *arg) {
+  return task_cancel_requested(((extract_progress_context_t *)arg)->task);
+}
+
+static void
+extract_progress(void *arg, unsigned long long done,
+                 unsigned long long total) {
+  extract_progress_context_t *ctx = arg;
+  unsigned long long add = done >= ctx->last_done ? done - ctx->last_done : done;
+
+  pthread_mutex_lock(&g_tasks_lock);
+  ctx->task->total = total;
+  pthread_mutex_unlock(&g_tasks_lock);
+  ctx->last_done = done;
+  task_update(ctx->task, TASK_RUNNING, NULL, add, NULL);
+}
+
+static void
+extract_current_file(void *arg, const char *path) {
+  extract_progress_context_t *ctx = arg;
+  task_update(ctx->task, TASK_RUNNING, path, 0, NULL);
+}
+
+static void *
+extract_task_worker(file_task_t *task) {
+  archive_helper_callbacks_t callbacks;
+  archive_helper_result_t helper_result;
+  extract_progress_context_t context;
+  memset(&context, 0, sizeof(context));
+  context.task = task;
+  if(task->extract_attached) context.last_done = task->done;
+  memset(&callbacks, 0, sizeof(callbacks));
+  callbacks.cancel_requested = extract_cancel_requested;
+  callbacks.progress = extract_progress;
+  callbacks.current_file = extract_current_file;
+  callbacks.arg = &context;
+  task_update(task, TASK_RUNNING, task->srcs[0], 0, NULL);
+
+  if((task->extract_attached ?
+      archive_helper_attach(task->id, &callbacks, &helper_result) :
+      archive_helper_extract(task->id, task->srcs, task->extract_destinations,
+                             task->src_count,
+                             task->password ? task->password : "",
+                             task->extract_overwrite,
+                             &callbacks, &helper_result))) {
+    if(!strcmp(helper_result.code, "canceled") || task_cancel_requested(task)) {
+      task_update(task, TASK_CANCELED,
+                  task->current[0] ? task->current : task->src,
+                  0, "canceled");
+    } else {
+      task_set_error_code(task,
+                          helper_result.code[0] ? helper_result.code :
+                          "archive_extract_failed",
+                          !strcmp(helper_result.code, "archive_password_required") ?
+                          (task->current[0] ? task->current : task->srcs[0]) :
+                          !strcmp(helper_result.code, "archive_missing_volume") ?
+                          helper_result.message : NULL);
+      task_update(task, TASK_FAILED,
+                  task->current[0] ? task->current : task->src, 0,
+                  helper_result.message[0] ? helper_result.message :
+                  "archive extraction failed");
+    }
+    return NULL;
+  }
+  {
+    time_t completed_at = time(NULL);
+    pthread_mutex_lock(&g_tasks_lock);
+    task->upload_completed = task->src_count;
+    task->state = TASK_DONE;
+    if(task->total) task->done = task->total;
+    else if(task->done) task->total = task->done;
+    task->updated_at = completed_at;
+    record_task_completion_locked(task, completed_at);
+    pthread_mutex_unlock(&g_tasks_lock);
+  }
+  return NULL;
+}
+
 static void *
 task_worker(void *arg) {
   file_task_t *task = arg;
@@ -1639,6 +1726,9 @@ task_worker(void *arg) {
   if(task_cancel_requested(task)) {
     task_update(task, TASK_CANCELED, task->src, 0, "canceled");
     return NULL;
+  }
+  if(task->op == TASK_EXTRACT) {
+    return extract_task_worker(task);
   }
   if(task->op == TASK_COPY || task->op == TASK_MOVE) {
     char error[160] = {0};
@@ -1803,6 +1893,52 @@ task_worker(void *arg) {
   }
 
   return NULL;
+}
+
+void
+filemgr_recover_extract_tasks(void) {
+  archive_helper_snapshot_t *snapshots = NULL;
+  size_t count = 0;
+  size_t i;
+
+  if(archive_helper_list_tasks(&snapshots, &count)) return;
+  for(i = 0; i < count; i++) {
+    archive_helper_snapshot_t *snapshot = &snapshots[i];
+    file_task_t *task = calloc(1, sizeof(*task));
+
+    if(!task) continue;
+    task->op = TASK_EXTRACT;
+    task->state = TASK_QUEUED;
+    task->id = snapshot->job_id;
+    task->srcs = snapshot->sources;
+    task->src_count = snapshot->count;
+    task->extract_destinations = snapshot->destinations;
+    task->extract_attached = 1;
+    task->total = snapshot->total;
+    task->done = snapshot->done;
+    task->upload_completed = snapshot->completed_count;
+    snprintf(task->src, sizeof(task->src), "%s%s", task->srcs[0],
+             task->src_count > 1 ? " ..." : "");
+    snprintf(task->dst, sizeof(task->dst), "%s", task->extract_destinations[0]);
+    snprintf(task->current, sizeof(task->current), "%s", snapshot->current);
+    task->created_at = time(NULL);
+    task->updated_at = task->created_at;
+    snapshot->sources = NULL;
+    snapshot->destinations = NULL;
+    snapshot->count = 0;
+
+    pthread_mutex_lock(&g_tasks_lock);
+    if(task->id >= g_next_task_id) g_next_task_id = task->id + 1;
+    task->next = g_tasks;
+    g_tasks = task;
+    pthread_mutex_unlock(&g_tasks_lock);
+    if(pthread_create(&task->thread, NULL, task_worker, task)) {
+      task_update(task, TASK_FAILED, NULL, 0, "pthread_create failed");
+    } else {
+      pthread_detach(task->thread);
+    }
+  }
+  archive_helper_free_snapshots(snapshots, count);
 }
 
 static enum MHD_Result
@@ -2190,6 +2326,149 @@ chmod_task_path(file_task_t *task, const char *path,
 }
 
 static enum MHD_Result
+api_extract(struct MHD_Connection *conn, const char *body, size_t body_size) {
+  char *paths_raw = body_form_value(body, body_size, "paths");
+  char *destination = fs_path_value(
+    body_form_value(body, body_size, "destination"));
+  char *separate_text = body_form_value(body, body_size, "separate");
+  char *overwrite_text = body_form_value(body, body_size, "overwrite");
+  char *password = body_form_value(body, body_size, "password");
+  char **paths = NULL;
+  char **destinations = NULL;
+  size_t count = 0;
+  struct stat st;
+  enum MHD_Result result;
+  int destination_stat;
+  int separate;
+  int overwrite;
+
+  if(!paths_raw || !destination ||
+     (strcmp(separate_text ? separate_text : "", "0") &&
+      strcmp(separate_text ? separate_text : "", "1")) ||
+     (strcmp(overwrite_text ? overwrite_text : "0", "0") &&
+      strcmp(overwrite_text ? overwrite_text : "", "1")) ||
+     parse_paths(paths_raw, &paths, &count)) {
+    result = send_json_error(conn, MHD_HTTP_BAD_REQUEST, "invalid path");
+    goto done;
+  }
+  separate = !strcmp(separate_text, "1");
+  overwrite = overwrite_text && !strcmp(overwrite_text, "1");
+  if(destination[0] != '/') {
+    result = send_json_error(conn, MHD_HTTP_BAD_REQUEST, "invalid path");
+    goto done;
+  }
+  destination_stat = lstat(destination, &st);
+  if(!destination_stat && !S_ISDIR(st.st_mode)) {
+    result = send_json_error_detail(
+      conn, MHD_HTTP_CONFLICT, "destination is not a directory",
+      "destination_must_be_directory", destination);
+    goto done;
+  }
+  if(destination_stat && errno != ENOENT) {
+    result = send_json_error(conn, MHD_HTTP_BAD_REQUEST, NULL);
+    goto done;
+  }
+  if(!(destinations = calloc(count, sizeof(*destinations)))) {
+    result = send_json_error(conn, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                             "out of memory");
+    goto done;
+  }
+  for(size_t i = 0; i < count; i++) {
+    char target[PATH_MAX];
+
+    if(lstat(paths[i], &st) || !S_ISREG(st.st_mode)) {
+      result = send_json_error_detail(
+        conn, MHD_HTTP_NOT_FOUND, "archive file not found",
+        "file_not_found", paths[i]);
+      goto done;
+    }
+    if(!archive_path_supported(paths[i])) {
+      result = send_json_error_detail(
+        conn, MHD_HTTP_BAD_REQUEST, "unsupported archive type",
+        "archive_type_unsupported", paths[i]);
+      goto done;
+    }
+    if(archive_output_path(paths[i], destination, separate,
+                           target, sizeof(target)) ||
+       !(destinations[i] = strdup(target))) {
+      result = send_json_error_detail(
+        conn, errno == ENOMEM ? MHD_HTTP_INTERNAL_SERVER_ERROR :
+                               MHD_HTTP_BAD_REQUEST,
+        errno == ENOMEM ? "out of memory" : "target path is too long",
+        errno == ENOMEM ? "out_of_memory" : "target_path_too_long",
+        errno == ENOMEM ? NULL : destination);
+      goto done;
+    }
+  }
+  if(archive_helper_probe()) {
+    result = send_json_error_detail(
+      conn, MHD_HTTP_SERVICE_UNAVAILABLE,
+      "WFM 7zip helper is not running",
+      "archive_helper_not_running", NULL);
+    goto done;
+  }
+  {
+    file_task_t *task = calloc(1, sizeof(*task));
+    strbuf_t response = {0};
+
+    if(!task || (password && password[0] &&
+                 !(task->password = strdup(password)))) {
+      free_task(task);
+      result = send_json_error(conn, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                               "out of memory");
+      goto done;
+    }
+    task->op = TASK_EXTRACT;
+    task->state = TASK_QUEUED;
+    task->srcs = paths;
+    task->src_count = count;
+    task->extract_destinations = destinations;
+    task->extract_overwrite = overwrite;
+    snprintf(task->src, sizeof(task->src), "%s%s",
+             paths[0], count > 1 ? " ..." : "");
+    snprintf(task->dst, sizeof(task->dst), "%s", destination);
+    task->created_at = time(NULL);
+    task->updated_at = task->created_at;
+    paths = NULL;
+    destinations = NULL;
+    count = 0;
+
+    pthread_mutex_lock(&g_tasks_lock);
+    remove_finished_tasks_locked();
+    if(has_active_task_locked()) {
+      pthread_mutex_unlock(&g_tasks_lock);
+      free_task(task);
+      result = send_json_error(conn, MHD_HTTP_CONFLICT,
+                               "another task is running");
+      goto done;
+    }
+    task->id = g_next_task_id++;
+    task->next = g_tasks;
+    g_tasks = task;
+    pthread_mutex_unlock(&g_tasks_lock);
+
+    if(pthread_create(&task->thread, NULL, task_worker, task)) {
+      task_update(task, TASK_FAILED, NULL, 0, "pthread_create failed");
+    } else {
+      pthread_detach(task->thread);
+    }
+    strbuf_printf(&response, "{\"ok\":true,\"task_id\":%lu}", task->id);
+    result = send_buffer(conn, MHD_HTTP_OK, response.data, "application/json");
+  }
+
+done:
+  if(password) memset(password, 0, strlen(password));
+  free(paths_raw);
+  free(destination);
+  free(separate_text);
+  free(overwrite_text);
+  free(password);
+  free_paths(paths, count);
+  free_paths(destinations, count);
+  return result;
+}
+
+static enum MHD_Result
 api_chmod(struct MHD_Connection *conn, const char *body, size_t body_size) {
   char *paths_raw = body_form_value(body, body_size, "paths");
   char *mode_text = body_form_value(body, body_size, "mode");
@@ -2416,6 +2695,11 @@ filemgr_api_request(struct MHD_Connection *conn, const char *url,
     return strcmp(method, MHD_HTTP_METHOD_POST) ?
       send_json_error(conn, MHD_HTTP_METHOD_NOT_ALLOWED, "invalid method") :
       api_chmod(conn, body, body_size);
+  }
+  if(!strcmp(url, "/api/extract")) {
+    return strcmp(method, MHD_HTTP_METHOD_POST) ?
+      send_json_error(conn, MHD_HTTP_METHOD_NOT_ALLOWED, "invalid method") :
+      api_extract(conn, body, body_size);
   }
   if(!strcmp(url, "/api/pkg-info")) {
     return strcmp(method, MHD_HTTP_METHOD_GET) ?

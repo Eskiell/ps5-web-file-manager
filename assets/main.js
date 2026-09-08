@@ -18,6 +18,7 @@ let directoryLoadingStartedAt = 0;
 let taskOverlayTimer = 0;
 let lastCompletionId = null;
 let taskPollFailedAlertShown = false;
+let taskPollPromise = null;
 let localActionBusy = false;
 let specialStoragePaths = {};
 let hasSpecialMntStorage = false;
@@ -28,6 +29,7 @@ let textEditorBusy = false;
 let permissionItems = [];
 let permissionOriginal = "";
 let permissionBusy = false;
+let extractItems = [];
 let pkgInfoItem = null;
 let pkgInfoRequestId = 0;
 let downloadFrame = null;
@@ -35,12 +37,17 @@ let uploadXhr = null;
 let uploadTerminalAbort = false;
 let L = {};
 
-const APP_VERSION = "v1.7";
+const APP_VERSION = "v1.8";
 const LAST_PATH_KEY = "ps5-web-file-mgr:last-path";
 const SORT_KEY = "ps5-web-file-mgr:list-sort";
+const ARCHIVE_PASSWORD_KEY = "ps5-web-file-mgr:archive-password";
 const LOADING_DISPLAY_DELAY = 250;
 const DOWNLOAD_OVERLAY_DISPLAY_DELAY = 1200;
 const SELECT_ALL_LOADING_THRESHOLD = 1000;
+const EXTRACT_NAME_LIMIT = 48;
+const ARCHIVE_FILE_RE = /\.(7z|001|zip|zipx|rar|arj|bz2|bzip2|tbz2?|cab|gz|gzip|tgz|tpz|lzh|lha|tar|xz|txz|z|taz|zst|tzst|xar|xip|cpio|lzma|pmd)$/i;
+const ARCHIVE_COMPOUND_SUFFIX_RE = /\.(tar\.(?:gz|bz2|xz|zst)|tbz2?|tgz|tpz|txz|taz|tzst)$/i;
+const ARCHIVE_SIMPLE_SUFFIX_RE = /\.(7z|zipx?|rar|arj|bz2|bzip2|cab|gz|gzip|lzh|lha|tar|xz|z|zst|xar|xip|cpio|lzma|pmd)$/i;
 const SORT_KEYS = { name: true, type: true, size: true, mtime: true, mode: true };
 
 let sortKey = "";
@@ -65,6 +72,7 @@ const pasteNameEl = document.getElementById("pasteName");
 const pasteCountEl = document.getElementById("pasteCount");
 const pasteTargetTextEl = document.getElementById("pasteTargetText");
 const installPkgBtn = document.getElementById("installPkgBtn");
+const extractBtn = document.getElementById("extractBtn");
 const clearClipboardBtn = document.getElementById("clearClipboardBtn");
 const downloadBtn = document.getElementById("downloadBtn");
 const uploadMenuEl = document.getElementById("uploadMenu");
@@ -99,6 +107,16 @@ const permissionRecursiveOptionEl = document.getElementById("permissionRecursive
 const permissionRecursiveEl = document.getElementById("permissionRecursive");
 const permissionCancelBtn = document.getElementById("permissionCancelBtn");
 const permissionApplyBtn = document.getElementById("permissionApplyBtn");
+const extractOverlayEl = document.getElementById("extractOverlay");
+const extractPathEl = document.getElementById("extractPath");
+const extractSeparateEl = document.getElementById("extractSeparate");
+const extractSeparateTextEl = document.getElementById("extractSeparateText");
+const extractCurrentEl = document.getElementById("extractCurrent");
+const extractCustomEl = document.getElementById("extractCustom");
+const extractCustomTextEl = document.getElementById("extractCustomText");
+const extractCustomPathEl = document.getElementById("extractCustomPath");
+const extractCancelBtn = document.getElementById("extractCancelBtn");
+const extractApplyBtn = document.getElementById("extractApplyBtn");
 const permissionChecks = [
   document.getElementById("permissionOwnerRead"),
   document.getElementById("permissionOwnerWrite"),
@@ -432,11 +450,11 @@ function taskElapsed(task) {
 }
 
 function opLabel(op) {
-  return { copy: t("copy"), move: t("move"), delete: t("delete"), chmod: t("permissionsTitle"), download: t("download"), upload: t("upload"), pkg_install: t("installPackage") }[op] || op;
+  return { copy: t("copy"), move: t("move"), delete: t("delete"), chmod: t("permissionsTitle"), download: t("download"), upload: t("upload"), extract: t("extract"), pkg_install: t("installPackage") }[op] || op;
 }
 
 function taskOpLabel(op) {
-  return { copy: t("copying"), move: t("moving"), delete: t("deleting"), chmod: t("changingPermissions"), download: t("downloading"), upload: t("uploading"), pkg_install: t("installPackage") }[op] || op;
+  return { copy: t("copying"), move: t("moving"), delete: t("deleting"), chmod: t("changingPermissions"), download: t("downloading"), upload: t("uploading"), extract: t("extracting"), pkg_install: t("installPackage") }[op] || op;
 }
 
 function isPlayStationBrowser() {
@@ -491,25 +509,56 @@ function taskFailureMessage(task) {
 }
 
 function handleTerminalTask(task) {
+  if (task.op === "extract" && task.state === "failed" &&
+      task.error_code === "archive_overwrite_required" && trackedTask &&
+      trackedTask.id === task.id && trackedTask.extractRequest) {
+    const request = trackedTask.extractRequest;
+    const password = trackedTask.extractPassword;
+    const passwordPrompted = trackedTask.extractPasswordPrompted;
+    clearTrackedTask();
+    if (confirm(t("extractOverwriteConfirm", {
+      names: task.error || ""
+    }))) {
+      startExtractRequest(request, password, true, passwordPrompted);
+      return true;
+    }
+    return false;
+  }
+  if (task.op === "extract" && task.state === "failed" &&
+      task.error_code === "archive_password_required" && trackedTask &&
+      trackedTask.id === task.id && trackedTask.extractRequest &&
+      !trackedTask.extractPasswordPrompted) {
+    const request = trackedTask.extractRequest;
+    const overwrite = trackedTask.extractOverwrite;
+    clearTrackedTask();
+    const password = prompt(t("archivePasswordPrompt"),
+      readSavedArchivePassword());
+    if (password !== null && password.length) {
+      saveArchivePassword(password);
+      startExtractRequest(request, password, overwrite, true);
+      return true;
+    }
+    return false;
+  }
   if (task.op === "pkg_install") {
     if (task.state === "failed") {
       const message = taskFailureMessage(task);
       setStatus(message);
       alert(message);
     }
-    return;
+    return false;
   }
   if (task.state === "failed") {
     clearTrackedTask();
     const message = taskFailureMessage(task);
     setStatus(message);
     alert(message);
-    return;
+    return false;
   }
   if (task.state === "canceled") {
     clearTrackedTask();
     setStatus(t("taskCanceled", { label: opLabel(task.op) }));
-    return;
+    return false;
   }
   if (task.state === "done") {
     if (trackedTask && trackedTask.id === task.id &&
@@ -517,6 +566,7 @@ function handleTerminalTask(task) {
     clearTrackedTask();
     setStatus(t("actionDone", { label: opLabel(task.op) }));
   }
+  return false;
 }
 
 function setStatus(text) {
@@ -567,6 +617,21 @@ function readSavedPath() {
   }
 }
 
+function readSavedArchivePassword() {
+  try {
+    return localStorage.getItem(ARCHIVE_PASSWORD_KEY) || "";
+  } catch (err) {
+    return "";
+  }
+}
+
+function saveArchivePassword(password) {
+  try {
+    localStorage.setItem(ARCHIVE_PASSWORD_KEY, password);
+  } catch (err) {
+  }
+}
+
 function historyPath() {
   const hash = window.location.hash || "";
   if (hash.length <= 1) return "";
@@ -613,7 +678,8 @@ function historyBlocked() {
     pendingOverlayText || taskOverlayTimer || !overlayEl.hidden ||
     !contentLoadingEl.hidden || contentEl.classList.contains("loading") ||
     !textEditorOverlayEl.hidden || !imagePreviewOverlayEl.hidden ||
-    !pkgInfoOverlayEl.hidden || !permissionOverlayEl.hidden);
+    !pkgInfoOverlayEl.hidden || !permissionOverlayEl.hidden ||
+    !extractOverlayEl.hidden);
 }
 
 function savePath(path) {
@@ -734,6 +800,22 @@ function isPkgPackage(item) {
   return item.type === "-" && /\.pkg$/i.test(item.name);
 }
 
+function isSupportedArchive(item) {
+  if (item.type !== "-") return false;
+  const part = /\.part(\d+)\.rar$/i.exec(item.name);
+  if (part) return Number(part[1]) === 1;
+  return ARCHIVE_FILE_RE.test(item.name);
+}
+
+function archiveFolderName(item) {
+  let name = displayName(item);
+  name = name.replace(/\.part\d+\.rar$/i, "");
+  name = name.replace(/\.001$/i, "");
+  name = name.replace(ARCHIVE_COMPOUND_SUFFIX_RE, "");
+  name = name.replace(ARCHIVE_SIMPLE_SUFFIX_RE, "");
+  return name || displayName(item);
+}
+
 function isSpecialDirectory(item) {
   if (item.type !== "d") return false;
   if (item.path === "/data") return true;
@@ -744,6 +826,7 @@ function isSpecialDirectory(item) {
 function itemTypeLabel(item) {
   if (item.type === "parent" || item.type === "d") return typeLabel(item.type);
   if (isPkgPackage(item)) return "PKG";
+  if (isSupportedArchive(item)) return t("archiveFile");
   if (isPreviewableImage(item)) return t("image");
   if (isEditableText(item)) return t("textFile");
   return t("file");
@@ -941,7 +1024,7 @@ function openPermissionDialog(item) {
   const items = selected.has(item.path) ? selectedEntries() : [item];
   setModalBackgroundLocked(true);
   permissionItems = items;
-  renderPermissionItems(items);
+  renderDialogItems(permissionPathEl, items);
   permissionModeEl.value = permissionModeText(item.mode);
   permissionOriginal = permissionModeEl.value;
   permissionRecursiveOptionEl.hidden = !items.some(entry => entry.type === "d");
@@ -972,6 +1055,111 @@ function requestClosePermissionDialog() {
        (!permissionRecursiveOptionEl.hidden && !permissionRecursiveEl.checked)) &&
       !confirm(t("unsavedPermissionConfirm"))) return;
   closePermissionDialog();
+}
+
+function extractFolderDisplayName(item) {
+  const name = archiveFolderName(item);
+  return name.length <= EXTRACT_NAME_LIMIT ? name :
+    name.slice(0, EXTRACT_NAME_LIMIT - 3) + "...";
+}
+
+function extractFolderList(items) {
+  const names = items.map(archiveFolderName).join(", ");
+  if (names.length <= EXTRACT_NAME_LIMIT) return names;
+  return t("extractFolderListMore", {
+    folders: names.slice(0, EXTRACT_NAME_LIMIT)
+  });
+}
+
+function syncExtractDestination(focusCustom) {
+  extractCustomPathEl.disabled = !extractCustomEl.checked;
+  if (focusCustom && extractCustomEl.checked) {
+    extractCustomPathEl.focus();
+    extractCustomPathEl.select();
+  }
+}
+
+function renderSingleExtractPath() {
+  if (!extractOverlayEl.hidden) renderSingleDialogPath(extractPathEl, extractItems);
+}
+
+function openExtractDialogForItems(items) {
+  if (busy || loadingPath || !items.length) return;
+
+  setModalBackgroundLocked(true);
+  extractItems = items.slice();
+  renderDialogItems(extractPathEl, items);
+  if (items.length === 1) {
+    extractSeparateTextEl.textContent = t("extractToFolder", {
+      name: extractFolderDisplayName(items[0])
+    });
+    extractCustomTextEl.textContent = t("extractToCustom");
+  } else {
+    extractSeparateTextEl.textContent = t("extractSeparateFolders", {
+      folders: extractFolderList(items)
+    });
+    extractCustomTextEl.textContent = t("extractToCustomSeparate");
+  }
+  extractSeparateEl.checked = true;
+  extractCustomPathEl.value = items.length === 1 ?
+    pathJoin(displayPath(cwd), archiveFolderName(items[0])) : displayPath(cwd);
+  syncExtractDestination(false);
+  extractOverlayEl.hidden = false;
+  renderSingleExtractPath();
+  extractApplyBtn.focus();
+}
+
+function actionExtractSelected() {
+  openExtractDialogForItems(selectedEntries().filter(isSupportedArchive));
+}
+
+function closeExtractDialog() {
+  extractOverlayEl.hidden = true;
+  extractItems = [];
+  extractPathEl.textContent = "";
+  extractPathEl.title = "";
+  extractCustomPathEl.value = "";
+  setModalBackgroundLocked(false);
+}
+
+async function startExtractRequest(request, password, overwrite, passwordPrompted) {
+  const payload = Object.assign({}, request);
+  if (password !== undefined) payload.password = password;
+  payload.overwrite = overwrite ? "1" : "0";
+  setBusy(true);
+  setStatus(t("extractStarting"));
+  taskRefreshPath = cwd;
+  try {
+    const data = await apiForm("/api/extract", payload);
+    trackTask(data.task_id, "extract", false);
+    trackedTask.extractRequest = request;
+    trackedTask.extractPassword = password;
+    trackedTask.extractOverwrite = Boolean(overwrite);
+    trackedTask.extractPasswordPrompted = Boolean(passwordPrompted);
+    clearSelection(false);
+    setStatus(t("taskCreated", { label: t("extract") }));
+    await pollTasks();
+  } catch (err) {
+    showActionFailed(t("extract"), err.message);
+    setBusy(false);
+  }
+}
+
+function submitExtractDialog() {
+  if (!extractItems.length) return;
+  if (extractCustomEl.checked && !extractCustomPathEl.value.trim()) {
+    extractCustomPathEl.focus();
+    return;
+  }
+  const items = extractItems.slice();
+  const useCustom = extractCustomEl.checked;
+  const request = {
+    paths: items.map(item => item.path).join("\n"),
+    destination: useCustom ? extractCustomPathEl.value.trim() : cwd,
+    separate: extractSeparateEl.checked || (useCustom && items.length > 1) ? "1" : "0"
+  };
+  closeExtractDialog();
+  startExtractRequest(request);
 }
 
 async function applyPermissionMode() {
@@ -1156,28 +1344,32 @@ function itemListTitle(items, limit) {
   return items.length > limit ? t("selectedItems", { name: shown, count: items.length }) : shown;
 }
 
-function renderSinglePermissionPath() {
-  if (permissionOverlayEl.hidden || permissionItems.length !== 1) return;
-  const namesEl = permissionPathEl.querySelector(".permission-path-names");
-  if (namesEl) renderEndOfPath(namesEl, displayPath(permissionItems[0].path));
+function renderSingleDialogPath(container, items) {
+  if (items.length !== 1) return;
+  const namesEl = container.querySelector(".permission-path-names");
+  if (namesEl) renderEndOfPath(namesEl, displayPath(items[0].path));
 }
 
-function renderPermissionItems(items) {
+function renderDialogItems(container, items) {
   const names = items.length === 1 ? displayPath(items[0].path) :
     items.map(displayName).join(", ");
   const count = items.length > 1 ? t("permissionObjectCount", { count: items.length }) : "";
   const namesEl = document.createElement("span");
   namesEl.className = "permission-path-names";
   namesEl.textContent = names;
-  permissionPathEl.innerHTML = "";
-  permissionPathEl.appendChild(namesEl);
+  container.innerHTML = "";
+  container.appendChild(namesEl);
   if (count) {
     const countEl = document.createElement("span");
     countEl.className = "permission-path-count";
     countEl.textContent = count;
-    permissionPathEl.appendChild(countEl);
+    container.appendChild(countEl);
   }
-  permissionPathEl.title = count ? names + " " + count : names;
+  container.title = count ? names + " " + count : names;
+}
+
+function renderSinglePermissionPath() {
+  if (!permissionOverlayEl.hidden) renderSingleDialogPath(permissionPathEl, permissionItems);
 }
 
 function compareText(a, b) {
@@ -1272,6 +1464,18 @@ function renderInstallPkgButton(items, locked) {
   installPkgBtn.disabled = locked;
 }
 
+function renderExtractButton(items, locked) {
+  const archives = items.filter(isSupportedArchive);
+  extractBtn.hidden = archives.length === 0;
+  if (!archives.length) {
+    extractBtn.title = "";
+    extractBtn.disabled = true;
+    return;
+  }
+  extractBtn.title = t("extract") + ": " + itemTitle(archives);
+  extractBtn.disabled = locked;
+}
+
 function singleSelected() {
   const items = selectedEntries();
   return items.length === 1 ? items[0] : null;
@@ -1302,6 +1506,7 @@ function updateButtons() {
   selectAllEl.checked = entries.length > 0 && items.length === entries.length;
   selectAllEl.indeterminate = items.length > 0 && items.length < entries.length;
   renderInstallPkgButton(items, locked);
+  renderExtractButton(items, locked);
   renderClipboard();
 }
 
@@ -1476,6 +1681,7 @@ function render() {
     iconImg.className = "icon" + (isSpecialDirectory(item) ? " special-folder-icon" : "");
     iconImg.src = isParent ? "/icon-up.png" : item.type === "d" ? "/icon-folder.png" :
       isPkgPackage(item) ? "/icon-pkg.png" :
+      isSupportedArchive(item) ? "/icon-archive.png" :
       isPreviewableImage(item) ? "/icon-image.png" :
       isEditableText(item) ? "/icon-file.png" : "/icon-generic.png";
     iconImg.alt = "";
@@ -1857,10 +2063,13 @@ function renderTasks(tasks) {
   const isDelete = task.op === "delete";
   const isDownload = task.op === "download";
   const isChmod = task.op === "chmod";
-  const isPreparing = (task.op === "copy" || task.op === "move" || isChmod) &&
-    task.state === "running" && done === 0;
-  const isFinishing = !isDelete && !isDownload && task.state === "running" && total > 0 && done >= total;
-  const pct = total > 0 ? Math.min(100, Math.floor(done * 100 / total)) : 0;
+  const isExtract = task.op === "extract";
+  const isPreparing = (task.op === "copy" || task.op === "move" ||
+    isChmod || isExtract) && task.state === "running" && done === 0;
+  const isFinishing = !isDelete && !isDownload && !isExtract &&
+    task.state === "running" && total > 0 && done >= total;
+  let pct = total > 0 ? Math.min(100, Math.floor(done * 100 / total)) : 0;
+  if (isExtract && task.state === "running" && pct >= 100) pct = 99;
   const div = document.createElement("div");
   div.className = "task " + task.state;
 
@@ -1934,9 +2143,14 @@ function renderTasks(tasks) {
   if (!task.error) renderTaskPath(current, task.current || task.src);
 }
 
-async function pollTasks() {
+async function pollTasksOnce() {
+  const trackedIdAtStart = trackedTask ? trackedTask.id : 0;
   try {
     const data = await api("/api/tasks");
+    if ((trackedTask ? trackedTask.id : 0) !== trackedIdAtStart) {
+      setTimeout(pollTasks, 0);
+      return;
+    }
     taskPollFailedAlertShown = false;
     const tasks = data.tasks || [];
     const fileTasks = tasks.filter(task => task.op !== "pkg_install");
@@ -1945,12 +2159,14 @@ async function pollTasks() {
       lastCompletionId = completion ? completion.id : 0;
     } else if (completion && completion.id !== lastCompletionId) {
       lastCompletionId = completion.id;
-      alert(t(completion.file_count ? "transferCompleteFiles" : "transferComplete", {
+      alert(t(completion.op === "extract" ? "extractComplete" :
+        completion.file_count ? "transferCompleteFiles" : "transferComplete", {
         label: opLabel(completion.op),
         name: taskSubject(completion),
         duration: formatDuration(Number(completion.elapsed || 0)),
         size: formatBytes(completion.total, true),
-        count: completion.file_count
+        count: completion.file_count,
+        archives: completion.src_count
       }));
     }
     const wasBusy = busy;
@@ -1969,11 +2185,12 @@ async function pollTasks() {
         trackedTask.state = task.state;
       }
       if (isTerminalTask(task)) {
-        if (task.op !== "pkg_install") shouldRefresh = true;
-        handleTerminalTask(task);
+        const retryingPassword = handleTerminalTask(task);
+        if (task.op !== "pkg_install" && !retryingPassword) shouldRefresh = true;
       }
     }
-    if (trackedTask && becameIdle && !sawTrackedTask) {
+    if (trackedTask && trackedTask.id === trackedIdAtStart &&
+        becameIdle && !sawTrackedTask) {
       if ((trackedTask.fromClipboard || trackedTask.clearClipboardOnDone) &&
           !trackedTask.cancelRequested) clearClipboardAfterPaste();
       shouldRefresh = true;
@@ -1990,6 +2207,18 @@ async function pollTasks() {
     const message = t("tasksPollFailed", { error: err.message });
     setStatus(message);
   }
+}
+
+function pollTasks() {
+  if (taskPollPromise) return taskPollPromise;
+  const request = pollTasksOnce();
+  taskPollPromise = request;
+  request.then(() => {
+    if (taskPollPromise === request) taskPollPromise = null;
+  }, () => {
+    if (taskPollPromise === request) taskPollPromise = null;
+  });
+  return request;
 }
 
 function actionCopy() {
@@ -2237,6 +2466,7 @@ document.getElementById("copyBtn").addEventListener("click", actionCopy);
 document.getElementById("moveBtn").addEventListener("click", actionMove);
 pasteBtn.addEventListener("click", actionPaste);
 installPkgBtn.addEventListener("click", actionInstallSelectedPkgs);
+extractBtn.addEventListener("click", actionExtractSelected);
 clearClipboardBtn.addEventListener("click", clearClipboard);
 document.getElementById("renameBtn").addEventListener("click", actionRename);
 downloadBtn.addEventListener("click", actionDownload);
@@ -2261,6 +2491,11 @@ pkgInfoImageEl.addEventListener("error", () => {
 });
 permissionCancelBtn.addEventListener("click", requestClosePermissionDialog);
 permissionApplyBtn.addEventListener("click", applyPermissionMode);
+extractCancelBtn.addEventListener("click", closeExtractDialog);
+extractApplyBtn.addEventListener("click", submitExtractDialog);
+extractSeparateEl.addEventListener("change", () => syncExtractDestination(false));
+extractCurrentEl.addEventListener("change", () => syncExtractDestination(false));
+extractCustomEl.addEventListener("change", () => syncExtractDestination(true));
 permissionModeEl.addEventListener("input", () => {
   if (validPermissionMode(permissionModeEl.value)) syncPermissionChecks(permissionModeEl.value);
 });
@@ -2269,6 +2504,12 @@ for (const checkbox of permissionChecks) checkbox.addEventListener("change", syn
 window.addEventListener("resize", () => {
   renderAddressPath();
   renderSinglePermissionPath();
+  renderSingleExtractPath();
+});
+window.addEventListener("beforeunload", event => {
+  if (!historyBlocked()) return;
+  event.preventDefault();
+  event.returnValue = "";
 });
 window.addEventListener("popstate", event => {
   if (historyBlocked()) {
@@ -2279,6 +2520,10 @@ window.addEventListener("popstate", event => {
     }
     if (!permissionOverlayEl.hidden) {
       requestClosePermissionDialog();
+      return;
+    }
+    if (!extractOverlayEl.hidden) {
+      closeExtractDialog();
       return;
     }
     if (!pkgInfoOverlayEl.hidden) {
@@ -2298,6 +2543,19 @@ document.addEventListener("click", event => {
   if (!uploadMenuEl || uploadMenuEl.contains(event.target)) return;
   uploadMenuEl.classList.remove("open");
 });
+document.addEventListener("keydown", event => {
+  if (event.key !== "Escape" && event.keyCode !== 27) return;
+  let handled = true;
+  if (!extractOverlayEl.hidden) closeExtractDialog();
+  else if (!permissionOverlayEl.hidden) requestClosePermissionDialog();
+  else if (!pkgInfoOverlayEl.hidden) closePkgInfo();
+  else if (!imagePreviewOverlayEl.hidden) closeImagePreview();
+  else if (!textEditorOverlayEl.hidden) requestCloseTextEditor();
+  else handled = false;
+  if (!handled) return;
+  event.preventDefault();
+  event.stopPropagation();
+}, true);
 document.querySelector("thead").addEventListener("click", event => {
   if (busy || loadingPath) return;
   if (parentBtn.contains(event.target)) return;
@@ -2316,6 +2574,9 @@ pkgInfoOverlayEl.addEventListener("click", event => {
 });
 permissionOverlayEl.addEventListener("click", event => {
   if (event.target === permissionOverlayEl) requestClosePermissionDialog();
+});
+extractOverlayEl.addEventListener("click", event => {
+  if (event.target === extractOverlayEl) closeExtractDialog();
 });
 contentEl.addEventListener("click", event => {
   if (!busy && !loadingPath) return;
@@ -2360,6 +2621,7 @@ filesEl.addEventListener("click", event => {
     }, 0);
   }
   else if (isPkgPackage(item)) openPkgInfo(item);
+  else if (isSupportedArchive(item)) openExtractDialogForItems([item]);
   else if (isPreviewableImage(item)) openImagePreview(item);
   else if (isEditableText(item)) openTextEditor(item);
   else togglePath(item.path, !selected.has(item.path));
@@ -2402,15 +2664,15 @@ async function init() {
   cwd = savedPath;
   renderAddressPath();
   taskRefreshPath = savedPath;
+  seedHistoryPath(cwd);
   refreshSpaces();
   await pollTasks();
   if (busy) {
     setStatus(t("activeTask"));
     return;
   }
-  if (await load(savedPath || "/", undefined, false, false)) {
-    seedHistoryPath(cwd);
-  } else if (savedPath !== "/" && await load("/", undefined, false, false)) {
+  if (!await load(savedPath || "/", undefined, false, false) &&
+      savedPath !== "/" && await load("/", undefined, false, false)) {
     seedHistoryPath(cwd);
   }
 }

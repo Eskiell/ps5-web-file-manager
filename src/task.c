@@ -23,6 +23,7 @@ task_op_name(task_op_t op) {
   case TASK_CHMOD: return "chmod";
   case TASK_DOWNLOAD: return "download";
   case TASK_UPLOAD: return "upload";
+  case TASK_EXTRACT: return "extract";
   case TASK_PKG_INSTALL: return "pkg_install";
   default: return "unknown";
   }
@@ -73,6 +74,11 @@ free_task(file_task_t *task) {
     return;
   }
   free_paths(task->srcs, task->src_count);
+  free_paths(task->extract_destinations, task->src_count);
+  if(task->password) {
+    memset(task->password, 0, strlen(task->password));
+    free(task->password);
+  }
   free(task);
 }
 

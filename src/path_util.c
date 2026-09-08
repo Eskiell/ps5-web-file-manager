@@ -95,7 +95,17 @@ body_form_value(const char *body, size_t body_size, const char *key) {
       eq++;
     }
     if(eq - start == key_len && !strncmp(body + start, key, key_len)) {
-      return form_decode(body + eq + (eq < end), end - eq - (eq < end));
+      size_t value_start = eq + (eq < end);
+      size_t i;
+      for(i = value_start; i < end; i++) {
+        if(body[i] == '\0' ||
+           (body[i] == '%' && i + 2 < end && body[i + 1] == '0' &&
+            body[i + 2] == '0')) {
+          errno = EINVAL;
+          return NULL;
+        }
+      }
+      return form_decode(body + value_start, end - value_start);
     }
   }
   return NULL;

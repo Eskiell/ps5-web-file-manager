@@ -1046,6 +1046,71 @@ input[type="checkbox"] {
   margin-left: 14px;
 }
 
+.extract-options {
+  padding: 8px 0 22px;
+  border-top: 1px solid #2d343d;
+}
+
+.extract-option {
+  min-height: 54px;
+  display: flex;
+  align-items: center;
+  color: #c9d3dc;
+  cursor: pointer;
+}
+
+.extract-option > input[type="radio"],
+.extract-custom-choice > input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  margin: 0 12px 0 0;
+}
+
+.extract-option > span,
+.extract-custom-choice > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.extract-custom-option {
+  display: block;
+  padding-top: 13px;
+}
+
+.extract-custom-choice {
+  display: flex;
+  align-items: center;
+  margin-bottom: 18px;
+  cursor: pointer;
+}
+
+.extract-custom-option > input[type="text"].extract-custom-path {
+  display: block;
+  width: calc(100% - 28px);
+  height: 46px;
+  box-sizing: border-box;
+  margin: 0 0 0 28px;
+  padding: 0 12px;
+  border: 1px solid #46515f;
+  border-radius: 6px;
+  outline: none;
+  background: #0f1215;
+  color: #edf0f2;
+  font: 17px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.extract-custom-path:focus {
+  border-color: #6fb1ff;
+  outline: 3px solid rgba(111, 177, 255, .25);
+}
+
+.extract-custom-path:disabled {
+  opacity: .45;
+}
+
 .task-overlay {
   position: fixed;
   top: 0;
