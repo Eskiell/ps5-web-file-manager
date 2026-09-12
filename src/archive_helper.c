@@ -23,7 +23,7 @@
 #define WFM_MAX_RESPONSE (64U * 1024U)
 #define WFM_HELPER_ELF "/data/wfm/wfm-7zip-helper.elf"
 #define WFM_ELFLDR_PORT 9021
-#define WFM_MAX_HELPER_SIZE (128LL * 1024LL * 1024LL)
+#define WFM_MAX_ELF_SIZE (128LL * 1024LL * 1024LL)
 #ifdef __linux__
 #define WFM_HELPER_SOCKET "/tmp/wfm-7zip-helper.sock"
 #else
@@ -226,9 +226,11 @@ ping_helper(int fd) {
 }
 
 int
-archive_helper_autostart(void) {
+archive_helper_send_elf(const char *path) {
 #ifdef __linux__
-  return 0;
+  (void)path;
+  errno = ENOTSUP;
+  return -1;
 #else
   struct sockaddr_in address;
   struct timeval timeout = {10, 0};
@@ -238,18 +240,17 @@ archive_helper_autostart(void) {
   int socket_fd = -1;
   int result = -1;
 
-  /* Never replace a connected daemon, even if it is temporarily slow. */
-  {
-    int probe = archive_helper_probe();
-    if(probe == 0 || probe == -2) return 0;
+  if(!path) {
+    errno = EINVAL;
+    return -1;
   }
-  if(stat(WFM_HELPER_ELF, &st)) return errno == ENOENT ? 0 : -1;
+  if(stat(path, &st)) return -1;
   if(!S_ISREG(st.st_mode) || st.st_size < 4 ||
-     st.st_size > WFM_MAX_HELPER_SIZE) {
+     st.st_size > WFM_MAX_ELF_SIZE) {
     errno = ENOEXEC;
     return -1;
   }
-  if((file_fd = open(WFM_HELPER_ELF, O_RDONLY)) < 0) return -1;
+  if((file_fd = open(path, O_RDONLY)) < 0) return -1;
   if(read(file_fd, buffer, 4) != 4 || memcmp(buffer, "\x7f" "ELF", 4)) {
     errno = ENOEXEC;
     goto done;
@@ -277,6 +278,19 @@ done:
   if(socket_fd >= 0) close(socket_fd);
   if(file_fd >= 0) close(file_fd);
   return result;
+#endif
+}
+
+int
+archive_helper_autostart(void) {
+#ifdef __linux__
+  return 0;
+#else
+  /* Never replace a connected daemon, even if it is temporarily slow. */
+  int probe = archive_helper_probe();
+  if(probe == 0 || probe == -2) return 0;
+  if(access(WFM_HELPER_ELF, F_OK)) return errno == ENOENT ? 0 : -1;
+  return archive_helper_send_elf(WFM_HELPER_ELF);
 #endif
 }
 

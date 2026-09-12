@@ -2326,6 +2326,51 @@ chmod_task_path(file_task_t *task, const char *path,
 }
 
 static enum MHD_Result
+api_launch_elf(struct MHD_Connection *conn, const char *body,
+               size_t body_size) {
+  char *path = fs_path_value(body_form_value(body, body_size, "path"));
+  const char *extension = path ? strrchr(path, '.') : NULL;
+  struct stat st;
+  enum MHD_Result result;
+
+  if(!path || path[0] != '/' || !extension || strcasecmp(extension, ".elf")) {
+    free(path);
+    return send_json_error_detail(conn, MHD_HTTP_BAD_REQUEST,
+                                  "file is not an ELF payload",
+                                  "elf_type_invalid", NULL);
+  }
+  if(lstat(path, &st) || !S_ISREG(st.st_mode)) {
+    result = send_json_error_detail(conn, MHD_HTTP_NOT_FOUND,
+                                    "ELF payload not found",
+                                    "file_not_found", path);
+    free(path);
+    return result;
+  }
+  if(has_active_task()) {
+    free(path);
+    return send_json_error(conn, MHD_HTTP_CONFLICT,
+                           "another task is running");
+  }
+
+  if(archive_helper_send_elf(path)) {
+    int error = errno;
+    result = send_json_error_detail(
+      conn, error == ENOTSUP ? MHD_HTTP_NOT_IMPLEMENTED :
+            error == ENOEXEC ? MHD_HTTP_BAD_REQUEST :
+                               MHD_HTTP_INTERNAL_SERVER_ERROR,
+      error == ENOTSUP ? "ELF launching is only available on PS5" :
+      error == ENOEXEC ? "file is not a valid ELF payload" :
+                         "could not send ELF payload to elfldr",
+      error == ENOTSUP ? "elf_launch_unsupported" :
+      error == ENOEXEC ? "elf_invalid" : "elf_launch_failed", path);
+  } else {
+    result = send_json_ok(conn);
+  }
+  free(path);
+  return result;
+}
+
+static enum MHD_Result
 api_extract(struct MHD_Connection *conn, const char *body, size_t body_size) {
   char *paths_raw = body_form_value(body, body_size, "paths");
   char *destination = fs_path_value(
@@ -2691,6 +2736,11 @@ filemgr_api_request(struct MHD_Connection *conn, const char *url,
   if(!strcmp(url, "/api/upload/finish")) return api_upload_finish(conn);
   if(!strcmp(url, "/api/rename")) return api_rename(conn);
   if(!strcmp(url, "/api/mkdir")) return api_mkdir(conn);
+  if(!strcmp(url, "/api/launch-elf")) {
+    return strcmp(method, MHD_HTTP_METHOD_POST) ?
+      send_json_error(conn, MHD_HTTP_METHOD_NOT_ALLOWED, "invalid method") :
+      api_launch_elf(conn, body, body_size);
+  }
   if(!strcmp(url, "/api/chmod")) {
     return strcmp(method, MHD_HTTP_METHOD_POST) ?
       send_json_error(conn, MHD_HTTP_METHOD_NOT_ALLOWED, "invalid method") :

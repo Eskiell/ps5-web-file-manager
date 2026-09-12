@@ -48,7 +48,7 @@ body {
   height: auto;
   min-height: 54px;
   display: flex;
-  align-items: start;
+  align-items: flex-start;
   flex-wrap: wrap;
   justify-content: space-between;
   padding: 0 18px;
@@ -627,10 +627,6 @@ tr.selected {
   background: #1d2d35;
 }
 
-tr[data-type="parent"] {
-  cursor: pointer;
-}
-
 .select-hit {
   height: 78px;
   min-height: 78px;
@@ -1109,6 +1105,34 @@ input[type="checkbox"] {
 
 .extract-custom-path:disabled {
   opacity: .45;
+}
+
+.drop-upload-overlay {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 19000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 11, 14, .88);
+  box-shadow: inset 0 0 0 4px #6fb1ff;
+  pointer-events: none;
+}
+
+.drop-upload-message {
+  max-width: calc(100% - 48px);
+  padding: 26px 34px;
+  border: 1px solid #46515f;
+  border-radius: 8px;
+  background: #1b2026;
+  box-shadow: 0 18px 54px rgba(0, 0, 0, .5);
+  color: #edf0f2;
+  font-size: 24px;
+  line-height: 1.4;
+  text-align: center;
 }
 
 .task-overlay {

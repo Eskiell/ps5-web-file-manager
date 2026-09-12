@@ -37,7 +37,7 @@ let uploadXhr = null;
 let uploadTerminalAbort = false;
 let L = {};
 
-const APP_VERSION = "v1.8";
+const APP_VERSION = "v1.9";
 const LAST_PATH_KEY = "ps5-web-file-mgr:last-path";
 const SORT_KEY = "ps5-web-file-mgr:list-sort";
 const ARCHIVE_PASSWORD_KEY = "ps5-web-file-mgr:archive-password";
@@ -81,6 +81,7 @@ const uploadMenuBtn = document.getElementById("uploadMenuBtn");
 const uploadFolderBtn = document.getElementById("uploadFolderBtn");
 const uploadFilesEl = document.getElementById("uploadFiles");
 const uploadFolderEl = document.getElementById("uploadFolder");
+const dropUploadOverlayEl = document.getElementById("dropUploadOverlay");
 const initLoadingEl = document.getElementById("initLoading");
 const exitBtn = document.getElementById("exitBtn");
 const textEditorOverlayEl = document.getElementById("textEditorOverlay");
@@ -394,7 +395,7 @@ async function fetchText(path, params) {
 }
 
 function formatSize(size, type) {
-  if (type === "d" || type === "parent") return "";
+  if (type === "d") return "";
   return formatBytes(size, true);
 }
 
@@ -782,11 +783,6 @@ function pathIsSameOrChild(parent, child) {
   return child === parent || (parent !== "/" && child.indexOf(parent + "/") === 0);
 }
 
-function typeLabel(type) {
-  if (type === "parent") return t("parent");
-  return type === "d" ? t("dir") : t("file");
-}
-
 function isEditableText(item) {
   return item.type === "-" &&
     /\.(txt|json|xml|ini|cfg|conf|md|log|lua|js|css|html?|c|h|cpp|hpp|sh|csv|ya?ml|shn)$/i.test(item.name);
@@ -798,6 +794,10 @@ function isPreviewableImage(item) {
 
 function isPkgPackage(item) {
   return item.type === "-" && /\.pkg$/i.test(item.name);
+}
+
+function isElfFile(item) {
+  return item.type === "-" && /\.elf$/i.test(item.name);
 }
 
 function isSupportedArchive(item) {
@@ -824,8 +824,9 @@ function isSpecialDirectory(item) {
 }
 
 function itemTypeLabel(item) {
-  if (item.type === "parent" || item.type === "d") return typeLabel(item.type);
+  if (item.type === "d") return t("dir");
   if (isPkgPackage(item)) return "PKG";
+  if (isElfFile(item)) return "ELF";
   if (isSupportedArchive(item)) return t("archiveFile");
   if (isPreviewableImage(item)) return t("image");
   if (isEditableText(item)) return t("textFile");
@@ -858,6 +859,13 @@ function installPkg(item) {
 
 function actionInstallSelectedPkgs() {
   return queuePkgInstall(selectedEntries().filter(isPkgPackage));
+}
+
+function launchElf(item) {
+  if (!confirm(t("elfLaunchConfirm", { name: displayName(item) }))) return;
+  runImmediateAction(t("launchElf"), () => apiForm("/api/launch-elf", {
+    path: item.path
+  }));
 }
 
 function openImagePreview(item) {
@@ -1645,28 +1653,23 @@ function render() {
   emptyEl.hidden = entries.length !== 0;
   const fragment = document.createDocumentFragment();
 
-  const rows = entries;
-
-  for (const item of rows) {
-    const isParent = item.type === "parent";
+  for (const item of entries) {
     const tr = document.createElement("tr");
     tr.dataset.path = item.path;
     tr.dataset.name = item.name;
     tr.dataset.type = item.type;
-    tr.className = (!isParent && selected.has(item.path) ? "selected " : "") +
+    tr.className = (selected.has(item.path) ? "selected " : "") +
       (focusedPath === item.path ? "focused" : "");
 
     const selectTd = document.createElement("td");
     selectTd.className = "select-cell";
-    if (!isParent) {
-      const label = document.createElement("label");
-      label.className = "select-hit";
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.checked = selected.has(item.path);
-      label.appendChild(checkbox);
-      selectTd.appendChild(label);
-    }
+    const label = document.createElement("label");
+    label.className = "select-hit";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = selected.has(item.path);
+    label.appendChild(checkbox);
+    selectTd.appendChild(label);
 
     const nameTd = document.createElement("td");
     nameTd.className = "name-col";
@@ -1679,8 +1682,9 @@ function render() {
     nameBtn.title = displayPath(item.path);
     const iconImg = document.createElement("img");
     iconImg.className = "icon" + (isSpecialDirectory(item) ? " special-folder-icon" : "");
-    iconImg.src = isParent ? "/icon-up.png" : item.type === "d" ? "/icon-folder.png" :
+    iconImg.src = item.type === "d" ? "/icon-folder.png" :
       isPkgPackage(item) ? "/icon-pkg.png" :
+      isElfFile(item) ? "/icon-elf.png" :
       isSupportedArchive(item) ? "/icon-archive.png" :
       isPreviewableImage(item) ? "/icon-image.png" :
       isEditableText(item) ? "/icon-file.png" : "/icon-generic.png";
@@ -1691,22 +1695,20 @@ function render() {
 
     const modeTd = document.createElement("td");
     modeTd.className = "mode-col";
-    if (!isParent) {
-      const modeBtn = document.createElement("button");
-      modeBtn.className = "mode-action";
-      modeBtn.type = "button";
-      modeBtn.textContent = permissionModeText(item.mode);
-      modeBtn.title = t("permissionChangeTitle", { name: displayName(item) });
-      modeBtn.setAttribute("aria-label", modeBtn.title);
-      modeBtn.disabled = busy || Boolean(loadingPath);
-      modeBtn.addEventListener("click", event => {
-        event.preventDefault();
-        event.stopPropagation();
-        focusPath(item.path);
-        openPermissionDialog(item);
-      });
-      modeTd.appendChild(modeBtn);
-    }
+    const modeBtn = document.createElement("button");
+    modeBtn.className = "mode-action";
+    modeBtn.type = "button";
+    modeBtn.textContent = permissionModeText(item.mode);
+    modeBtn.title = t("permissionChangeTitle", { name: displayName(item) });
+    modeBtn.setAttribute("aria-label", modeBtn.title);
+    modeBtn.disabled = busy || Boolean(loadingPath);
+    modeBtn.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      focusPath(item.path);
+      openPermissionDialog(item);
+    });
+    modeTd.appendChild(modeBtn);
 
     appendChildren(
       tr,
@@ -2342,7 +2344,7 @@ function uploadFileRequest(taskId, file, rel, overwrite, index) {
   });
 }
 
-async function uploadFiles(files) {
+async function uploadFiles(files, relativeNames) {
   if (busy || loadingPath || !files.length) return;
   const useLoading = files.length >= SELECT_ALL_LOADING_THRESHOLD;
   let list;
@@ -2359,7 +2361,7 @@ async function uploadFiles(files) {
     list = Array.prototype.slice.call(files);
     for (let i = 0; i < list.length; i++) {
       const file = list[i];
-      rels.push(uploadRelativeName(file));
+      rels.push(relativeNames ? relativeNames[i] : uploadRelativeName(file));
       sizes.push(String(file.size || 0));
       total += Number(file.size || 0);
     }
@@ -2427,6 +2429,102 @@ async function uploadFiles(files) {
   }
 }
 
+async function readDroppedDirectory(directory) {
+  const reader = directory.createReader();
+  const entries = [];
+  for (;;) {
+    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+    if (!batch.length) return entries;
+    for (const entry of batch) entries.push(entry);
+  }
+}
+
+async function collectDroppedEntry(entry, prefix, files, relativeNames) {
+  if (entry.isFile) {
+    const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+    files.push(file);
+    relativeNames.push(prefix + file.name);
+    return;
+  }
+  if (!entry.isDirectory) return;
+  const entries = await readDroppedDirectory(entry);
+  const childPrefix = prefix + entry.name + "/";
+  for (let i = 0; i < entries.length; i++) {
+    await collectDroppedEntry(entries[i], childPrefix, files, relativeNames);
+  }
+}
+
+async function uploadDroppedItems(dataTransfer) {
+  const files = [];
+  const relativeNames = [];
+  const entries = [];
+  const items = dataTransfer.items;
+
+  if (items && items.length) {
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].kind !== "file") continue;
+      const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
+      if (entry) entries.push(entry);
+      else {
+        const file = items[i].getAsFile();
+        if (file) {
+          files.push(file);
+          relativeNames.push(file.name);
+        }
+      }
+    }
+  } else {
+    for (let i = 0; i < dataTransfer.files.length; i++) {
+      files.push(dataTransfer.files[i]);
+      relativeNames.push(uploadRelativeName(dataTransfer.files[i]));
+    }
+  }
+  for (let i = 0; i < entries.length; i++) {
+    await collectDroppedEntry(entries[i], "", files, relativeNames);
+  }
+  await uploadFiles(files, relativeNames);
+}
+
+function dataTransferHasFiles(dataTransfer) {
+  const types = dataTransfer && dataTransfer.types;
+  if (!types) return false;
+  for (let i = 0; i < types.length; i++) {
+    if (types[i] === "Files") return true;
+  }
+  return false;
+}
+
+function setupDropUpload() {
+  let dragDepth = 0;
+  window.addEventListener("dragenter", event => {
+    if (!dataTransferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepth++;
+    if (!busy && !loadingPath) dropUploadOverlayEl.hidden = false;
+  });
+  window.addEventListener("dragover", event => {
+    if (!dataTransferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  });
+  window.addEventListener("dragleave", () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) dropUploadOverlayEl.hidden = true;
+  });
+  window.addEventListener("drop", event => {
+    if (!dataTransferHasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepth = 0;
+    dropUploadOverlayEl.hidden = true;
+    if (busy || loadingPath) return;
+    uploadDroppedItems(event.dataTransfer).catch(err => {
+      const message = t("uploadFailed", { error: err.message || t("backendError") });
+      setStatus(message);
+      alert(message);
+    });
+  });
+}
+
 function actionUploadFiles() {
   if (busy || loadingPath) return;
   uploadMenuEl.classList.remove("open");
@@ -2476,6 +2574,7 @@ uploadMenuBtn.addEventListener("click", toggleUploadMenu);
 uploadFolderBtn.addEventListener("click", actionUploadFolder);
 uploadFilesEl.addEventListener("change", () => uploadFiles(uploadFilesEl.files));
 uploadFolderEl.addEventListener("change", () => uploadFiles(uploadFolderEl.files));
+if (!isPlayStationBrowser()) setupDropUpload();
 exitBtn.addEventListener("click", actionExit);
 parentBtn.addEventListener("click", actionParentDirectory);
 textEditorCloseBtn.addEventListener("click", requestCloseTextEditor);
@@ -2604,7 +2703,7 @@ filesEl.addEventListener("click", event => {
   if (!row) return;
   let target = event.target;
   while (target && target !== row && !target.classList.contains("row-action")) target = target.parentNode;
-  if (target === row && row.dataset.type !== "parent") return;
+  if (target === row) return;
   const item = {
     path: row.dataset.path,
     name: row.dataset.name,
@@ -2612,15 +2711,15 @@ filesEl.addEventListener("click", event => {
     displayName: decodeFsText(row.dataset.name)
   };
   focusPath(item.path);
-  if (item.type === "parent" || item.type === "d") {
-    const revealPath = item.type === "parent" ? cwd : "";
+  if (item.type === "d") {
     setTimeout(async () => {
-      if (await load(item.path, item.type === "parent" ? false : undefined, false, true, "push")) {
-        if (revealPath) revealPathInList(revealPath);
-      } else await load(cwd, false, true);
+      if (!await load(item.path, undefined, false, true, "push")) {
+        await load(cwd, false, true);
+      }
     }, 0);
   }
   else if (isPkgPackage(item)) openPkgInfo(item);
+  else if (isElfFile(item)) launchElf(item);
   else if (isSupportedArchive(item)) openExtractDialogForItems([item]);
   else if (isPreviewableImage(item)) openImagePreview(item);
   else if (isEditableText(item)) openTextEditor(item);

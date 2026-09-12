@@ -36,6 +36,7 @@ typedef struct archive_helper_snapshot {
 #define ARCHIVE_HELPER_TASK_CANCELED 4U
 
 int archive_helper_autostart(void);
+int archive_helper_send_elf(const char *path);
 int archive_helper_probe(void);
 int archive_helper_list_tasks(archive_helper_snapshot_t **snapshots,
                               size_t *count);
