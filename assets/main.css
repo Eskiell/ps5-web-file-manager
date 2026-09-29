@@ -456,6 +456,10 @@ th {
   font-weight: 600;
 }
 
+thead th + th {
+  border-left: 1px solid #2d343d;
+}
+
 th.sortable {
   cursor: pointer;
 }
@@ -515,6 +519,61 @@ th.name-col.sorted-asc .name-heading::after {
 
 th.name-col.sorted-desc .name-heading::after {
   content: "v";
+}
+
+.name-filter {
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  margin-left: auto;
+  padding: 0 18px 0 8px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #8f9aa5;
+  font-size: 16px;
+}
+
+.name-filter-text {
+  display: block;
+  min-width: 0;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.name-filter-icon {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.name-filter.active .name-filter-icon {
+  margin-left: 8px;
+}
+
+.name-filter .filter-clear,
+.name-filter.active:hover .filter-search {
+  display: none;
+}
+
+.name-filter.active:hover .filter-clear {
+  display: block;
+}
+
+.name-head button.name-filter:hover:not(:disabled) {
+  background: transparent;
+  color: #edf0f2;
+}
+
+.name-filter:focus {
+  outline-offset: -4px;
 }
 
 .parent-nav-button {
@@ -693,7 +752,6 @@ input[type="checkbox"] {
   flex: 0 0 auto;
   height: 46px;
   min-height: 46px;
-  padding: 0 25px;
   line-height: 46px;
   border-top: 1px solid #2d343d;
   background: #15191e;
@@ -703,9 +761,27 @@ input[type="checkbox"] {
   justify-content: space-between;
 }
 
+.status-text {
+  padding-left: 25px;
+}
+
 .version-text {
   flex: 0 0 auto;
+  align-self: stretch;
+  min-width: 0;
+  min-height: 0;
+  height: auto;
+  border: 0;
+  border-left: 1px solid #2d343d;
+  background: transparent;
   color: #7f8a94;
+  font-size: inherit;
+  padding: 0 25px 0 16px;
+}
+
+.status button.version-text:hover:not(:disabled) {
+  background: transparent;
+  color: #edf0f2;
 }
 
 .text-editor-overlay {
@@ -1488,6 +1564,10 @@ input[type="checkbox"] {
     padding-left: 12px;
   }
 
+  .name-filter {
+    padding-right: 12px;
+  }
+
   .row-action {
     padding: 10px 12px;
   }
@@ -1506,9 +1586,17 @@ input[type="checkbox"] {
   .status {
     height: 34px;
     min-height: 34px;
-    padding: 0 12px;
+    padding: 0;
     line-height: 34px;
     font-size: 14px;
+  }
+
+  .status-text {
+    padding-left: 12px;
+  }
+
+  .version-text {
+    padding: 0 12px;
   }
 
   .task-overlay {

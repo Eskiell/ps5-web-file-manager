@@ -79,6 +79,14 @@
                   <img src="/icon-back.png" alt="">
                 </button>
                 <span class="name-heading" data-i18n="name"></span>
+                <button id="nameFilterBtn" class="name-filter" type="button" aria-label="Filter by name">
+                  <span id="nameFilterText" class="name-filter-text" hidden></span>
+                  <svg class="name-filter-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <circle class="filter-search" cx="10.5" cy="10.5" r="6.5"></circle>
+                    <path class="filter-search" d="m15.5 15.5 5 5"></path>
+                    <path class="filter-clear" d="M5 5l14 14M19 5L5 19"></path>
+                  </svg>
+                </button>
               </div>
             </th>
             <th class="type-col sortable" data-sort="type" data-i18n="type"></th>
@@ -96,8 +104,8 @@
     </section>
 
     <footer class="status">
-      <div id="statusText" data-i18n="ready"></div>
-      <div id="versionText" class="version-text"></div>
+      <div id="statusText" class="status-text" data-i18n="ready"></div>
+      <button id="versionText" class="version-text" type="button" aria-label="About PS5 Web File Manager"></button>
     </footer>
   </main>
 

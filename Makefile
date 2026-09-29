@@ -13,7 +13,7 @@ ifeq ($(MAKECMDGOALS),)
   endif
 endif
 
-VERSION_TAG := v1.9
+VERSION_TAG := v1.10
 TITLE_ID    := FMGR88888
 PYTHON      ?= python3
 STRIP       ?= $(PS5_PAYLOAD_SDK)/bin/prospero-strip
@@ -40,7 +40,7 @@ CFLAGS += `$(PKG_CONFIG) libmicrohttpd --cflags`
 LDFLAGS := -Wl,--gc-sections
 LDADD  := `$(PKG_CONFIG) libmicrohttpd --libs`
 LDADD  += -lSceIpmi -lSceAppInstUtil -lSceUserService
-LINUX_CFLAGS := -O2 -flto -Wall -Werror -Isrc -DVERSION_TAG=\"$(VERSION_TAG)\" -DTITLE_ID=\"$(TITLE_ID)\"
+LINUX_CFLAGS := -O2 -flto=auto -Wall -Werror -Isrc -DVERSION_TAG=\"$(VERSION_TAG)\" -DTITLE_ID=\"$(TITLE_ID)\"
 LINUX_CFLAGS += `$(HOST_PKG_CONFIG) libmicrohttpd --cflags`
 LINUX_LDADD := `$(HOST_PKG_CONFIG) libmicrohttpd --libs` -pthread
 

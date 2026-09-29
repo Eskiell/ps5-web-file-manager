@@ -37,12 +37,12 @@ let uploadXhr = null;
 let uploadTerminalAbort = false;
 let L = {};
 
-const APP_VERSION = "v1.9";
+const APP_VERSION = "v1.10";
 const LAST_PATH_KEY = "ps5-web-file-mgr:last-path";
 const SORT_KEY = "ps5-web-file-mgr:list-sort";
 const ARCHIVE_PASSWORD_KEY = "ps5-web-file-mgr:archive-password";
 const LOADING_DISPLAY_DELAY = 250;
-const DOWNLOAD_OVERLAY_DISPLAY_DELAY = 1200;
+const TASK_OVERLAY_DISPLAY_DELAY = 1200;
 const SELECT_ALL_LOADING_THRESHOLD = 1000;
 const EXTRACT_NAME_LIMIT = 48;
 const ARCHIVE_FILE_RE = /\.(7z|001|zip|zipx|rar|arj|bz2|bzip2|tbz2?|cab|gz|gzip|tgz|tpz|lzh|lha|tar|xz|txz|z|taz|zst|tzst|xar|xip|cpio|lzma|pmd)$/i;
@@ -52,6 +52,7 @@ const SORT_KEYS = { name: true, type: true, size: true, mtime: true, mode: true 
 
 let sortKey = "";
 let sortDir = "none";
+let nameFilter = "";
 
 const filesEl = document.getElementById("files");
 const contentEl = document.getElementById("content");
@@ -62,6 +63,8 @@ const pathEl = document.getElementById("path");
 const spaceInfoEl = document.getElementById("spaceInfo");
 const statusEl = document.getElementById("statusText");
 const versionEl = document.getElementById("versionText");
+const nameFilterBtn = document.getElementById("nameFilterBtn");
+const nameFilterTextEl = document.getElementById("nameFilterText");
 const tasksEl = document.getElementById("tasks");
 const overlayEl = document.getElementById("taskOverlay");
 const selectAllEl = document.getElementById("selectAll");
@@ -175,6 +178,16 @@ function backendErrorText(code, arg, fallback) {
   return L[key] ? t(key, params) : fallback || t("backendError");
 }
 
+function updateNameFilterButton() {
+  nameFilterTextEl.textContent = nameFilter;
+  nameFilterTextEl.title = nameFilter;
+  nameFilterTextEl.hidden = !nameFilter;
+  nameFilterBtn.classList.toggle("active", Boolean(nameFilter));
+  const label = t(nameFilter ? "clearNameFilter" : "filterName");
+  nameFilterBtn.title = label;
+  nameFilterBtn.setAttribute("aria-label", label);
+}
+
 function applyStaticText() {
   document.title = t("appTitle");
   for (const el of document.querySelectorAll("[data-i18n]")) {
@@ -188,6 +201,7 @@ function applyStaticText() {
   parentBtn.title = t("parent");
   parentBtn.setAttribute("aria-label", t("parent"));
   versionEl.textContent = APP_VERSION;
+  updateNameFilterButton();
   if (initLoadingEl) initLoadingEl.hidden = true;
 }
 
@@ -585,17 +599,13 @@ function setModalBackgroundLocked(value) {
   updateButtons();
 }
 
-function showTaskOverlay(immediate, delay) {
+function showTaskOverlay() {
   setBusy(true);
   if (!overlayEl.hidden || taskOverlayTimer) return;
-  if (immediate) {
-    overlayEl.hidden = false;
-    return;
-  }
   taskOverlayTimer = setTimeout(() => {
     taskOverlayTimer = 0;
     overlayEl.hidden = false;
-  }, delay || LOADING_DISPLAY_DELAY);
+  }, TASK_OVERLAY_DISPLAY_DELAY);
 }
 
 function hideTaskOverlay() {
@@ -767,6 +777,12 @@ function updateSpecialStoragePaths(spaces) {
   specialStoragePaths = next;
   hasSpecialMntStorage = hasMnt;
   if (changed && entries.length) render();
+}
+
+function visibleEntries() {
+  if (!nameFilter) return entries;
+  const query = nameFilter.toLowerCase();
+  return entries.filter(item => displayName(item).toLowerCase().includes(query));
 }
 
 function selectedEntries() {
@@ -1509,10 +1525,12 @@ function updateButtons() {
   for (const button of filesEl.querySelectorAll(".row-action, .mode-action")) button.disabled = locked;
   for (const checkbox of filesEl.querySelectorAll(".select-cell input")) checkbox.disabled = locked;
   selectAllEl.disabled = locked;
+  nameFilterBtn.disabled = locked;
   parentBtn.disabled = locked || cwd === "/";
   exitBtn.disabled = locked;
-  selectAllEl.checked = entries.length > 0 && items.length === entries.length;
-  selectAllEl.indeterminate = items.length > 0 && items.length < entries.length;
+  const visibleCount = visibleEntries().length;
+  selectAllEl.checked = visibleCount > 0 && items.length === visibleCount;
+  selectAllEl.indeterminate = items.length > 0 && items.length < visibleCount;
   renderInstallPkgButton(items, locked);
   renderExtractButton(items, locked);
   renderClipboard();
@@ -1650,10 +1668,12 @@ function clearSelection(updateVisibleRows) {
 function render() {
   hoveredRow = null;
   filesEl.innerHTML = "";
-  emptyEl.hidden = entries.length !== 0;
+  const visible = visibleEntries();
+  emptyEl.hidden = visible.length !== 0;
+  emptyEl.textContent = entries.length ? t("noMatches") : t("empty");
   const fragment = document.createDocumentFragment();
 
-  for (const item of entries) {
+  for (const item of visible) {
     const tr = document.createElement("tr");
     tr.dataset.path = item.path;
     tr.dataset.name = item.name;
@@ -1771,6 +1791,10 @@ async function load(path, scrollTop, force, alertOnError, historyMode) {
       await showContentLoadingAfterDelay();
     }
     if (!contentLoadingEl.hidden) await nextPaint();
+    if (cwd !== data.path && nameFilter) {
+      nameFilter = "";
+      updateNameFilterButton();
+    }
     cwd = data.path;
     renderAddressPath();
     savePath(cwd);
@@ -1958,7 +1982,7 @@ function showPendingOverlay(text, label) {
   pendingOverlayText = text;
   pendingOverlayLabel = label || "";
   renderPendingOverlay(text, pendingOverlayLabel);
-  showTaskOverlay(true);
+  showTaskOverlay();
 }
 
 function renderTaskPath(element, path) {
@@ -2049,8 +2073,7 @@ function renderTasks(tasks) {
 
   tasksEl.innerHTML = "";
   const hasActive = Boolean(active);
-  if (hasActive) showTaskOverlay(false, active.op === "download" ?
-    DOWNLOAD_OVERLAY_DISPLAY_DELAY : LOADING_DISPLAY_DELAY);
+  if (hasActive) showTaskOverlay();
   else {
     hideTaskOverlay();
     if (!localActionBusy) setBusy(false);
@@ -2576,7 +2599,34 @@ uploadFilesEl.addEventListener("change", () => uploadFiles(uploadFilesEl.files))
 uploadFolderEl.addEventListener("change", () => uploadFiles(uploadFolderEl.files));
 if (!isPlayStationBrowser()) setupDropUpload();
 exitBtn.addEventListener("click", actionExit);
+versionEl.addEventListener("click", () => {
+  alert(`PS5 Web File Manager ${APP_VERSION}
+
+A file manager for PS5 with a web UI. It is primarily intended for quickly and safely copying game dump folders from USB storage to internal storage.
+
+Credits:
+ps5-payload-dev/websrv, ps5-payload-dev/ftpsrv,
+seregonwar/zftpd, itsPLK/ps5-payload-manager,
+libmicrohttpd, ps5-payload-dev/sdk, etaHEN, ezremote.
+
+License:
+GPLv3 or later. Third-party licenses apply; libmicrohttpd is LGPL.`);
+});
 parentBtn.addEventListener("click", actionParentDirectory);
+nameFilterBtn.addEventListener("click", event => {
+  event.stopPropagation();
+  if (busy || loadingPath) return;
+  if (nameFilter) nameFilter = "";
+  else {
+    const value = prompt(t("nameFilterPrompt"));
+    if (!value) return;
+    nameFilter = value;
+  }
+  selected.clear();
+  updateNameFilterButton();
+  render();
+  resetScrollTop();
+});
 textEditorCloseBtn.addEventListener("click", requestCloseTextEditor);
 textEditorSaveBtn.addEventListener("click", saveTextEditor);
 newTextBtn.addEventListener("click", actionNewText);
@@ -2727,17 +2777,18 @@ filesEl.addEventListener("click", event => {
 });
 selectAllEl.addEventListener("change", async () => {
   if (busy || loadingPath) {
-    selectAllEl.checked = selected.size > 0 && selected.size === entries.length;
+    selectAllEl.checked = selected.size > 0 && selected.size === visibleEntries().length;
     return;
   }
   const checked = selectAllEl.checked;
-  const useLoading = entries.length >= SELECT_ALL_LOADING_THRESHOLD;
+  const visible = visibleEntries();
+  const useLoading = visible.length >= SELECT_ALL_LOADING_THRESHOLD;
   if (useLoading) {
     showContentLoading(t("processing"));
     await nextPaint();
   }
   selected.clear();
-  if (checked) entries.forEach(item => selected.add(item.path));
+  if (checked) visible.forEach(item => selected.add(item.path));
   render();
   if (useLoading) hideContentLoading();
 });
