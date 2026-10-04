@@ -1,4 +1,5 @@
 #include <signal.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,13 +25,40 @@ static volatile sig_atomic_t g_stop_requested;
 static int g_listen_fd = -1;
 
 static void
+websrv_set_socket_option(int fd, int level, int option, int value,
+                         const char *name) {
+  if(setsockopt(fd, level, option, &value, sizeof(value)) < 0) {
+    fprintf(stderr, "HTTP socket fd=%d %s requested=%d failed: %s\n",
+            fd, name, value, strerror(errno));
+  }
+}
+
+static void
+websrv_log_socket_buffers(int fd, const char *kind) {
+  const int options[] = { SO_RCVBUF, SO_SNDBUF };
+  const char *names[] = { "SO_RCVBUF", "SO_SNDBUF" };
+  size_t i;
+  for(i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    int value = 0;
+    socklen_t size = sizeof(value);
+    if(getsockopt(fd, SOL_SOCKET, options[i], &value, &size) < 0) {
+      fprintf(stderr, "HTTP %s fd=%d get %s failed: %s\n",
+              kind, fd, names[i], strerror(errno));
+    } else {
+      printf("HTTP %s fd=%d %s actual=%d bytes\n", kind, fd, names[i], value);
+    }
+  }
+}
+
+static void
 websrv_tune_connection_socket(int fd) {
   const int sndbuf = HTTP_SOCKET_SNDBUF_SIZE;
   const int nodelay = 1;
 
   /* OrbisOS HTTP sockets need an explicit send buffer to fill a GbE link. */
-  (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-  (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+  websrv_set_socket_option(fd, SOL_SOCKET, SO_SNDBUF, sndbuf, "SO_SNDBUF");
+  websrv_set_socket_option(fd, IPPROTO_TCP, TCP_NODELAY, nodelay, "TCP_NODELAY");
+  websrv_log_socket_buffers(fd, "connection");
 }
 
 typedef struct request_context {
@@ -209,7 +237,8 @@ websrv_listen(unsigned short port) {
     const int rcvbuf = HTTP_SOCKET_RCVBUF_SIZE;
 
     /* Set before listen so accepted PS5 sockets inherit the larger window. */
-    (void)setsockopt(srvfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    websrv_set_socket_option(srvfd, SOL_SOCKET, SO_RCVBUF, rcvbuf, "SO_RCVBUF");
+    websrv_log_socket_buffers(srvfd, "listener");
   }
 
   memset(&server_addr, 0, sizeof(server_addr));

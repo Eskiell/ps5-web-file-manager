@@ -21,6 +21,16 @@ typedef struct upload_context {
   int fd;
   char *buffer;
   size_t buffered;
+  char *writer_buffer;
+  size_t writer_size;
+  int writer_started;
+  int writer_pending;
+  int writer_busy;
+  int writer_stop;
+  int writer_error;
+  pthread_t writer_thread;
+  pthread_mutex_t writer_mutex;
+  pthread_cond_t writer_cond;
   char temp[PATH_MAX];
   char target[PATH_MAX];
   unsigned long long expected;
@@ -45,22 +55,19 @@ upload_error_message(upload_context_t *ctx) {
 }
 
 static int
-upload_flush(upload_context_t *ctx) {
+upload_write(upload_context_t *ctx, const char *data, size_t size) {
   size_t written = 0;
 
-  while(written < ctx->buffered) {
+  while(written < size) {
     ssize_t n;
 
     if(ctx->task && task_cancel_requested(ctx->task)) {
-      ctx->failed = 1;
-      ctx->error = ECANCELED;
-      return -1;
+      return ECANCELED;
     }
-    n = write(ctx->fd, ctx->buffer + written, ctx->buffered - written);
+    n = write(ctx->fd, data + written, size - written);
+    if(n < 0 && errno == EINTR) continue;
     if(n <= 0) {
-      ctx->failed = 1;
-      ctx->error = errno ? errno : EIO;
-      return -1;
+      return n < 0 ? errno : EIO;
     }
     written += (size_t)n;
     ctx->written += (unsigned long long)n;
@@ -69,7 +76,100 @@ upload_flush(upload_context_t *ctx) {
     task_update(ctx->task, TASK_RUNNING, ctx->target,
                 (unsigned long long)written, NULL);
   }
-  ctx->buffered = 0;
+  return 0;
+}
+
+static void *
+upload_writer(void *arg) {
+  upload_context_t *ctx = arg;
+
+  pthread_mutex_lock(&ctx->writer_mutex);
+  for(;;) {
+    int error;
+    while(!ctx->writer_pending && !ctx->writer_stop) {
+      pthread_cond_wait(&ctx->writer_cond, &ctx->writer_mutex);
+    }
+    if(ctx->writer_stop && !ctx->writer_pending) break;
+    ctx->writer_pending = 0;
+    ctx->writer_busy = 1;
+    pthread_mutex_unlock(&ctx->writer_mutex);
+    error = upload_write(ctx, ctx->writer_buffer, ctx->writer_size);
+    pthread_mutex_lock(&ctx->writer_mutex);
+    if(error) ctx->writer_error = error;
+    ctx->writer_busy = 0;
+    pthread_cond_broadcast(&ctx->writer_cond);
+  }
+  pthread_mutex_unlock(&ctx->writer_mutex);
+  return NULL;
+}
+
+static void
+upload_writer_start(upload_context_t *ctx) {
+  ctx->writer_buffer = malloc(UPLOAD_BUFFER_SIZE);
+  if(!ctx->writer_buffer) return;
+  if(pthread_mutex_init(&ctx->writer_mutex, NULL) == 0) {
+    if(pthread_cond_init(&ctx->writer_cond, NULL) == 0) {
+      ctx->writer_started =
+          pthread_create(&ctx->writer_thread, NULL, upload_writer, ctx) == 0;
+      if(!ctx->writer_started) pthread_cond_destroy(&ctx->writer_cond);
+    }
+    if(!ctx->writer_started) pthread_mutex_destroy(&ctx->writer_mutex);
+  }
+  if(!ctx->writer_started) {
+    free(ctx->writer_buffer);
+    ctx->writer_buffer = NULL;
+  }
+}
+
+static int
+upload_writer_stop(upload_context_t *ctx, int drain) {
+  int error = 0;
+  if(!ctx->writer_started) return 0;
+  pthread_mutex_lock(&ctx->writer_mutex);
+  if(!drain) ctx->writer_pending = 0;
+  while(ctx->writer_busy || (drain && ctx->writer_pending)) {
+    pthread_cond_wait(&ctx->writer_cond, &ctx->writer_mutex);
+  }
+  error = ctx->writer_error;
+  ctx->writer_stop = 1;
+  pthread_cond_signal(&ctx->writer_cond);
+  pthread_mutex_unlock(&ctx->writer_mutex);
+  pthread_join(ctx->writer_thread, NULL);
+  pthread_cond_destroy(&ctx->writer_cond);
+  pthread_mutex_destroy(&ctx->writer_mutex);
+  ctx->writer_started = 0;
+  return error;
+}
+
+static int
+upload_flush(upload_context_t *ctx) {
+  int error;
+  if(!ctx->buffered) return 0;
+  if(ctx->writer_started) {
+    pthread_mutex_lock(&ctx->writer_mutex);
+    while(ctx->writer_pending || ctx->writer_busy) {
+      pthread_cond_wait(&ctx->writer_cond, &ctx->writer_mutex);
+    }
+    error = ctx->writer_error;
+    if(!error) {
+      char *next = ctx->writer_buffer;
+      ctx->writer_buffer = ctx->buffer;
+      ctx->buffer = next;
+      ctx->writer_size = ctx->buffered;
+      ctx->buffered = 0;
+      ctx->writer_pending = 1;
+      pthread_cond_signal(&ctx->writer_cond);
+    }
+    pthread_mutex_unlock(&ctx->writer_mutex);
+  } else {
+    error = upload_write(ctx, ctx->buffer, ctx->buffered);
+    if(!error) ctx->buffered = 0;
+  }
+  if(error) {
+    ctx->failed = 1;
+    ctx->error = error;
+    return -1;
+  }
   return 0;
 }
 
@@ -107,6 +207,8 @@ finish_upload_task(file_task_t *task, task_state_t state, const char *current,
 
 static void
 finish_upload_context_error(upload_context_t *ctx) {
+  /* No worker may update task progress after a terminal error is published. */
+  upload_writer_stop(ctx, 0);
   if(!ctx->task || ctx->task_done) {
     return;
   }
@@ -419,6 +521,8 @@ filemgr_upload_begin(struct MHD_Connection *conn, void **upload_ctx) {
     ctx->error = ENOMEM;
     goto fail;
   }
+  /* Two bounded buffers overlap reception and writes; fall back on init failure. */
+  if(ctx->expected >= UPLOAD_BUFFER_SIZE) upload_writer_start(ctx);
 
 fail:
   free_paths(checked_dirs, checked_dir_count);
@@ -494,6 +598,16 @@ filemgr_upload_finish(struct MHD_Connection *conn, void *upload_ctx) {
     ctx->error = ctx->error ? ctx->error : EIO;
     goto done;
   }
+  ctx->error = upload_writer_stop(ctx, 1);
+  if(ctx->error) {
+    ctx->failed = 1;
+    goto done;
+  }
+  if(ctx->task && task_cancel_requested(ctx->task)) {
+    ctx->failed = 1;
+    ctx->error = ECANCELED;
+    goto done;
+  }
   ctx->stage = "verifying uploaded size";
   if(ctx->expected && ctx->written != ctx->expected) {
     ctx->error = EIO;
@@ -529,6 +643,7 @@ filemgr_upload_finish(struct MHD_Connection *conn, void *upload_ctx) {
   ret = 0;
 
 done:
+  upload_writer_stop(ctx, 0);
   if(ctx->fd >= 0) {
     close(ctx->fd);
     ctx->fd = -1;
@@ -557,6 +672,7 @@ filemgr_upload_free(void *upload_ctx) {
   if(!ctx) {
     return;
   }
+  upload_writer_stop(ctx, 0);
   if(ctx->fd >= 0) {
     close(ctx->fd);
     if(ctx->temp[0]) {
@@ -571,6 +687,7 @@ filemgr_upload_free(void *upload_ctx) {
     }
   }
   free(ctx->buffer);
+  free(ctx->writer_buffer);
   if(ctx->task) {
     pthread_mutex_lock(&g_tasks_lock);
     if(ctx->task->active_streams) {
