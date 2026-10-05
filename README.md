@@ -51,7 +51,7 @@ It depends on PS5 payload SDK first: [ps5-payload-dev/sdk](https://github.com/ps
 export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 ```
 
-This project links against `libmicrohttpd`. `make` checks for it before building and runs the installer script automatically if it is missing:
+This project uses `libmicrohttpd` for HTTP and `libsmb2` for SMB. `make` checks for `libmicrohttpd` before building and runs the installer script automatically if it is missing:
 
 ```sh
 make
@@ -129,6 +129,7 @@ This project was built with reference to these projects:
 - **[seregonwar/zftpd](https://github.com/seregonwar/zftpd):** PS5 TCP socket buffer tuning and high-throughput transfer behavior reference. License: MIT.
 - **[itsPLK/ps5-payload-manager](https://github.com/itsPLK/ps5-payload-manager):** Payload building behavior. License: GPLv3.
 - **[libmicrohttpd](https://ftp.gnu.org/gnu/libmicrohttpd/):** Used as the embedded HTTP server library. It is licensed by GNU under the LGPL; this payload links it as the SDK-provided static library.
+- **[libsmb2](https://github.com/sahlberg/libsmb2):** SMB2/3 client library. License: LGPLv2.1.
 - **[ps5-payload-dev/sdk](https://github.com/ps5-payload-dev/sdk):** Payload building foundation. License: GPLv3+.
 - **[etaHEN](https://github.com/etaHEN/etaHEN):** ShellUI URI navigation used to return to the PS5 home screen before exit. License: GPLv3.
 - **[ezremote](https://github.com/cy33hc/ps5-ezremote-client):** Preview PKG info. License: GPLv2.
@@ -139,4 +140,4 @@ The project is distributed under GPLv3 or later, matching the GPLv3+ projects us
 
 Third-party projects retain their own licenses. Do not copy assets or source from the credited projects into another distribution without preserving the corresponding license notices.
 
-If distributing binaries, comply with the LGPL terms for libmicrohttpd in addition to this project's GPL license.
+If distributing binaries, comply with the LGPL terms for libmicrohttpd and libsmb2 in addition to this project's GPL license.

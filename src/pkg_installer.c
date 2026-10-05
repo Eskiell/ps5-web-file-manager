@@ -1,12 +1,43 @@
 #include "pkg_installer.h"
 
-#ifndef __linux__
-
 #include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
+#include <time.h>
+
+#include "smb.h"
+#include "websrv.h"
+#include "pkg_info.h"
+#include "path_util.h"
+
+/* Keep successful source URLs alive: installation can continue after submission. */
+typedef struct pkg_source_url {
+  char name[64];
+  char *path;
+  struct pkg_source_url *next;
+} pkg_source_url_t;
+static pkg_source_url_t *sources;
+static pthread_mutex_t sources_lock = PTHREAD_MUTEX_INITIALIZER;
+
+char *pkg_installer_source_path(const char *name) {
+  char *path = NULL;
+  const char *extension = strrchr(name, '.');
+  if(!extension || (strcmp(extension, ".pkg") && strcmp(extension, ".png"))) return NULL;
+  pthread_mutex_lock(&sources_lock);
+  for(pkg_source_url_t *source = sources; source; source = source->next) {
+    if(strlen(source->name) == (size_t)(extension - name) && !strncmp(source->name, name, (size_t)(extension - name))) {
+      path = strdup(source->path); break;
+    }
+  }
+  pthread_mutex_unlock(&sources_lock);
+  return path;
+}
+
+#ifndef __linux__
 
 typedef struct pkg_metadata {
   const char *uri;
@@ -19,7 +50,9 @@ typedef struct pkg_metadata {
   uint32_t is_playgo_enabled;
 } pkg_metadata_t;
 
-_Static_assert(sizeof(pkg_metadata_t) == 0x38,
+_Static_assert(offsetof(pkg_metadata_t, slot) == 0x30 &&
+               offsetof(pkg_metadata_t, is_playgo_enabled) == 0x34 &&
+               sizeof(pkg_metadata_t) == 0x38,
                "sceAppInstUtil metadata ABI mismatch");
 
 typedef struct pkg_info {
@@ -69,7 +102,10 @@ pkg_installer_initialize(void) {
 
 int
 pkg_installer_install(const char *path) {
-  char install_path[PATH_MAX + sizeof("/user")];
+  char install_path[PATH_MAX + 128];
+  char icon_url[160] = {0};
+  pkg_details_t details;
+  pkg_source_url_t *source = NULL;
   const char *uri = path;
   pkg_metadata_t metadata = {
     .uri = NULL,
@@ -84,9 +120,39 @@ pkg_installer_install(const char *path) {
   pkg_info_t pkg_info = {0};
   playgo_info_t playgo_info = {0};
   int result;
+  int remote;
 
   if(!path) return -1;
-  if(!strncmp(path, "/data/", 6)) {
+  remote = smb_path(path);
+  pkg_read_details(path, &details);
+  metadata.content_name = details.title[0] ? details.title : path_basename(path);
+  metadata.content_id = details.content_id;
+#if WFM_DEBUG
+  fprintf(stderr, "PKG metadata platform=%s content_id=%s title=%s icon=%d\n",
+          details.platform == 5 ? "PS5" : details.platform == 4 ? "PS4" : "unknown",
+          details.content_id, metadata.content_name, details.has_icon);
+#endif
+  if(remote || details.has_icon) {
+    unsigned short port = websrv_port();
+    struct timespec now;
+    if(!port || clock_gettime(CLOCK_REALTIME, &now) || !(source = calloc(1, sizeof(*source)))) return -1;
+    if(!(source->path = strdup(path))) { free(source); return -1; }
+    static unsigned long serial;
+    pthread_mutex_lock(&sources_lock);
+    snprintf(source->name, sizeof(source->name), "%llu-%lu-%lu", (unsigned long long)now.tv_sec,
+             (unsigned long)now.tv_nsec, ++serial);
+    source->next = sources; sources = source;
+    pthread_mutex_unlock(&sources_lock);
+    if(remote) {
+      snprintf(install_path, sizeof(install_path), "http://127.0.0.1:%u/pkg-source/%s.pkg", port, source->name);
+      uri = install_path;
+    }
+    if(details.has_icon) {
+      snprintf(icon_url, sizeof(icon_url), "http://127.0.0.1:%u/pkg-source/%s.png", port, source->name);
+      metadata.icon_url = icon_url;
+    }
+  }
+  if(!remote && !strncmp(path, "/data/", 6)) {
     snprintf(install_path, sizeof(install_path), "/user%s", path);
     uri = install_path;
   }
@@ -94,12 +160,16 @@ pkg_installer_install(const char *path) {
 
   pthread_mutex_lock(&installer_lock);
   result = initialize_locked();
-  if(result) {
-    pthread_mutex_unlock(&installer_lock);
-    return result;
-  }
-  result = sceAppInstUtilInstallByPackage(&metadata, &pkg_info, &playgo_info);
+  if(!result) result = sceAppInstUtilInstallByPackage(&metadata, &pkg_info, &playgo_info);
   pthread_mutex_unlock(&installer_lock);
+  if(result && source) {
+    pthread_mutex_lock(&sources_lock);
+    pkg_source_url_t **link = &sources;
+    while(*link && *link != source) link = &(*link)->next;
+    if(*link) *link = source->next;
+    pthread_mutex_unlock(&sources_lock);
+    free(source->path); free(source);
+  }
   return result;
 }
 

@@ -11,6 +11,7 @@
 
 #include "json_util.h"
 #include "path_util.h"
+#include "smb.h"
 
 static unsigned long long
 vfs_bytes(fsblkcnt_t blocks, unsigned long block_size) {
@@ -96,8 +97,8 @@ api_space(struct MHD_Connection *conn) {
                   free_bytes, total_bytes, is_current ? "true" : "false");
   }
 #else
-  const char *paths[] = {"/", current && strcmp(current, "/") ? current : NULL};
-  const char *labels[] = {"storageRoot", "storageCurrent"};
+  const char *paths[] = {"/"};
+  const char *labels[] = {"storageRoot"};
   for(size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
     struct statvfs vfs;
     unsigned long block_size;
@@ -119,9 +120,10 @@ api_space(struct MHD_Connection *conn) {
     strbuf_append(&b, ",\"path\":");
     json_escape(&b, paths[i]);
     strbuf_printf(&b, ",\"free\":%llu,\"total\":%llu,\"current\":%s}",
-                  free_bytes, total_bytes, i ? "true" : "false");
+                  free_bytes, total_bytes, smb_path(current) ? "false" : "true");
   }
 #endif
+  smb_append_spaces(&b, current, &first);
   free(current);
   strbuf_append(&b, "]}");
   return send_buffer(conn, MHD_HTTP_OK, b.data, "application/json");

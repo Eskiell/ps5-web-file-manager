@@ -18,6 +18,8 @@
 #include <unistd.h>
 
 #include "path_util.h"
+#include "smb.h"
+#include "vfs.h"
 
 int
 ignore_chmod_error(int err) {
@@ -37,6 +39,7 @@ fs_type_has_unix_modes(const char *type) {
 
 static int
 path_has_unix_modes(const char *path) {
+  if(smb_path(path)) return 0;
 #ifdef __linux__
   (void)path;
   return 1;
@@ -52,6 +55,7 @@ path_has_unix_modes(const char *path) {
 
 static int
 fd_has_unix_modes(int fd) {
+  if(wfm_fd_remote(fd)) return 0;
 #ifdef __linux__
   (void)fd;
   return 1;
@@ -67,6 +71,7 @@ fd_has_unix_modes(int fd) {
 
 int
 chmod_path_mode(const char *path, unsigned int mode) {
+  if(smb_path(path)) { errno = ENOTSUP; return -1; }
   if(!path_has_unix_modes(path)) {
     return 0;
   }

@@ -233,6 +233,15 @@ path_basename_copy(const char *path, char *out, size_t size) {
 
 int
 path_dirname(const char *path, char *out, size_t size) {
+  if(!strncmp(path, "smb://", 6)) {
+    const char *share = strchr(path + 6, '/');
+    const char *child = share ? strchr(share + 1, '/') : NULL;
+    if(share && (!child || !child[1])) {
+      if(size < 2) return -1;
+      strcpy(out, "/");
+      return 0;
+    }
+  }
   const char *base = path_basename(path);
   size_t len = (size_t)(base - path);
 

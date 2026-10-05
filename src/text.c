@@ -14,6 +14,8 @@
 #include "json_util.h"
 #include "path_util.h"
 #include "websrv.h"
+#include "vfs.h"
+#include "transfer.h"
 
 #define TEXT_FILE_MAX_SIZE (1024 * 1024)
 
@@ -189,8 +191,8 @@ format_text_for_save(const char *body, size_t body_size,
 static int
 read_text_file(const char *path, char **data, size_t *size,
                struct stat *st) {
-  FILE *file;
-  size_t read_size;
+  int fd;
+  size_t read_size = 0;
 
   *data = NULL;
   *size = 0;
@@ -201,22 +203,26 @@ read_text_file(const char *path, char **data, size_t *size,
     errno = EFBIG;
     return -1;
   }
-  if(!(file = fopen(path, "rb"))) {
+  if((fd = open(path, O_RDONLY)) < 0) {
     return -1;
   }
   if(!(*data = malloc((size_t)st->st_size + 1))) {
-    fclose(file);
+    close(fd);
     errno = ENOMEM;
     return -1;
   }
-  read_size = fread(*data, 1, (size_t)st->st_size, file);
-  if(read_size != (size_t)st->st_size || ferror(file)) {
-    free(*data);
-    *data = NULL;
-    fclose(file);
-    return -1;
+  while(read_size < (size_t)st->st_size) {
+    ssize_t count = read(fd, *data + read_size, (size_t)st->st_size - read_size);
+    if(count <= 0) {
+      free(*data);
+      *data = NULL;
+      close(fd);
+      if(!count) errno = EIO;
+      return -1;
+    }
+    read_size += (size_t)count;
   }
-  fclose(file);
+  close(fd);
   (*data)[read_size] = 0;
   *size = read_size;
   return 0;
@@ -330,7 +336,6 @@ write_text_atomic(const char *path, const char *body, size_t body_size,
                   mode_t mode) {
   struct timespec now;
   char temp[PATH_MAX];
-  size_t written = 0;
   int fd = -1;
   int ret = -1;
   int n;
@@ -345,13 +350,7 @@ write_text_atomic(const char *path, const char *body, size_t body_size,
   if((fd = open(temp, O_WRONLY | O_CREAT | O_EXCL, 0600)) < 0) {
     return -1;
   }
-  while(written < body_size) {
-    ssize_t count = write(fd, body + written, body_size - written);
-    if(count <= 0) {
-      goto done;
-    }
-    written += (size_t)count;
-  }
+  if(transfer_write_all(NULL, fd, path, body, body_size, NULL)) goto done;
   if(fchmod(fd, mode & 07777) && !ignore_chmod_error(errno)) {
     goto done;
   }

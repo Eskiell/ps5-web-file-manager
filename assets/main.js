@@ -38,6 +38,10 @@ let uploadTerminalAbort = false;
 let L = {};
 
 const APP_VERSION = "v1.10";
+const SMB_PASSWORD_KEY = "ps5-web-file-mgr:smb-password:";
+const smbPasswords = {};
+const smbReady = {};
+
 const LAST_PATH_KEY = "ps5-web-file-mgr:last-path";
 const SORT_KEY = "ps5-web-file-mgr:list-sort";
 const ARCHIVE_PASSWORD_KEY = "ps5-web-file-mgr:archive-password";
@@ -61,6 +65,12 @@ const contentLoadingTextEl = contentLoadingEl.querySelector(".content-loading-te
 const emptyEl = document.getElementById("empty");
 const pathEl = document.getElementById("path");
 const spaceInfoEl = document.getElementById("spaceInfo");
+const manageSmbBtn = document.getElementById("manageSmbBtn");
+const smbManagerOverlayEl = document.getElementById("smbManagerOverlay");
+const smbConnectionListEl = document.getElementById("smbConnectionList");
+const smbManagerAddBtn = document.getElementById("smbManagerAddBtn");
+const smbManagerCloseBtn = document.getElementById("smbManagerCloseBtn");
+let smbConnections = [];
 const statusEl = document.getElementById("statusText");
 const versionEl = document.getElementById("versionText");
 const nameFilterBtn = document.getElementById("nameFilterBtn");
@@ -257,10 +267,25 @@ function hideContentLoading() {
 async function request(path, params, options) {
   const qs = new URLSearchParams(params || {});
   const fetchOptions = Object.assign({ method: "POST" }, options || {});
+  if (path.indexOf("/api/smb/") !== 0 && path !== "/api/space") {
+    await ensureSmbPaths(params);
+    if (fetchOptions.body && fetchOptions.headers &&
+        fetchOptions.headers["Content-Type"] === "application/x-www-form-urlencoded") {
+      const values = {};
+      new URLSearchParams(fetchOptions.body).forEach((value, key) => { values[key] = value; });
+      await ensureSmbPaths(values);
+    }
+  }
   const response = await fetch(path + (qs.toString() ? "?" + qs.toString() : ""), fetchOptions);
   if (!response.ok) {
     const data = await response.json();
-    throw new Error(backendErrorText(data.error_code, data.error_arg, data.error));
+    const error = new Error(backendErrorText(data.error_code, data.error_arg, data.error));
+    error.code = data.error_code;
+    // Recheck browser credentials on the next operation after a backend restart/error.
+    if (path.indexOf("/api/smb/") !== 0 && path !== "/api/space") {
+      for (const root of Object.keys(smbReady)) delete smbReady[root];
+    }
+    throw error;
   }
   return response;
 }
@@ -648,7 +673,7 @@ function historyPath() {
   if (hash.length <= 1) return "";
   try {
     const path = decodeURIComponent(hash.slice(1));
-    return path.charAt(0) === "/" ? path : "";
+    return path.charAt(0) === "/" || /^smb:\/\/[^/]+\/[^/]+/.test(path) ? path : "";
   } catch (err) {
     return "";
   }
@@ -665,6 +690,16 @@ function writeHistoryPath(path, replace) {
 
 function pathHistoryChain(path) {
   const clean = String(path || "/").replace(/\/+$/, "") || "/";
+  if (/^smb:\/\//.test(clean)) {
+    const segments = clean.slice(6).split("/");
+    const chain = ["/"];
+    let current = "smb://" + segments[0];
+    for (let i = 1; i < segments.length; i++) {
+      current += "/" + segments[i];
+      chain.push(current);
+    }
+    return chain;
+  }
   const parts = clean.split("/");
   const chain = ["/"];
   let current = "";
@@ -686,7 +721,7 @@ function seedHistoryPath(path) {
 
 function historyBlocked() {
   return Boolean(busy || loadingPath || pendingAbortController ||
-    pendingOverlayText || taskOverlayTimer || !overlayEl.hidden ||
+    pendingOverlayText || taskOverlayTimer || !overlayEl.hidden || !smbManagerOverlayEl.hidden ||
     !contentLoadingEl.hidden || contentEl.classList.contains("loading") ||
     !textEditorOverlayEl.hidden || !imagePreviewOverlayEl.hidden ||
     !pkgInfoOverlayEl.hidden || !permissionOverlayEl.hidden ||
@@ -722,34 +757,114 @@ function saveSort() {
   }
 }
 
+function fitSpaceOptions() {
+  const select = document.getElementById("spaceSelect");
+  if (!select || !select.clientWidth) return;
+  const style = getComputedStyle(select);
+  const context = document.createElement("canvas").getContext("2d");
+  context.font = style.font || style.fontSize + " " + style.fontFamily;
+  // Let very narrow headers wrap the controls rather than clip capacity text.
+  if (window.innerWidth <= 640) {
+    let minimum = 0;
+    for (const option of select.options) {
+      const text = option.smbName === undefined ? option.textContent : "smb …" + option.spaceSuffix;
+      minimum = Math.max(minimum, context.measureText(text).width);
+    }
+    const prefix = spaceInfoEl.querySelector(".space-prefix");
+    const padding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) + 32 +
+      parseFloat(style.marginLeft) + (prefix ? prefix.getBoundingClientRect().width : 0);
+    spaceInfoEl.style.minWidth = Math.min(Math.ceil(minimum + padding), spaceInfoEl.parentNode.clientWidth) + "px";
+  } else {
+    spaceInfoEl.style.minWidth = "";
+  }
+  // Reserve padding and the native dropdown arrow; only shorten SMB names.
+  const width = select.clientWidth - parseFloat(style.paddingLeft) -
+    parseFloat(style.paddingRight) - 30;
+  for (const option of select.options) {
+    if (option.smbName === undefined) continue;
+    const name = Array.from(option.smbName);
+    let text = "smb " + name.join("") + option.spaceSuffix;
+    if (context.measureText(text).width > width) {
+      while (name.length && context.measureText("smb " + name.join("") + "…" + option.spaceSuffix).width > width) {
+        name.pop();
+      }
+      text = "smb " + name.join("") + "…" + option.spaceSuffix;
+    }
+    option.textContent = text;
+  }
+  const selected = select.options[select.selectedIndex];
+  select.title = selected ? selected.title : "";
+}
+
 async function refreshSpaces() {
   try {
     const data = await api("/api/space", { path: cwd });
+    const previousConnections = smbConnections;
+    smbConnections = (data.spaces || []).filter(item => /^smb:\/\//.test(item.path || ""));
+    for (const previous of previousConnections) {
+      const next = smbConnections.find(item => item.path === previous.path);
+      if (!next) forgetSmbPassword(previous.path);
+      else if (next.user !== previous.user || next.domain !== previous.domain) delete smbReady[previous.path];
+    }
+    if (!smbManagerOverlayEl.hidden && !localActionBusy) renderSmbConnections();
     updateSpecialStoragePaths(data.spaces || []);
     spaceInfoEl.innerHTML = "";
+    const select = document.createElement("select");
+    select.id = "spaceSelect";
+    select.className = "space-select";
+    select.disabled = spaceNavigationLocked();
+    let currentIndex = -1;
+    let internalIndex = -1;
     if ((data.spaces || []).length) {
-      const prefix = document.createElement("span");
+      const prefix = document.createElement("label");
       prefix.className = "space-prefix";
-      prefix.textContent = t("freeSpace");
+      prefix.htmlFor = select.id;
+      prefix.textContent = t("disks");
       spaceInfoEl.appendChild(prefix);
     }
     for (const item of data.spaces || []) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "space-item" + (item.current ? " current" : "");
-      const label = item.label_key ? t(item.label_key) : item.label;
-      button.textContent = label + ": " +
-        formatBytes(item.free, false) + "/" + formatBytes(item.total, false);
-      button.title = item.path + " " + button.textContent;
-      if (item.current) button.setAttribute("aria-current", "location");
-      button.disabled = spaceNavigationLocked();
-      bindPress(button, () => {
-        if (!item.path || spaceNavigationLocked()) return;
-        load(item.path, undefined, false, true, "push");
-      });
-      spaceInfoEl.appendChild(button);
+      const option = document.createElement("option");
+      option.value = item.path || "";
+      const remote = /^smb:\/\//.test(item.path || "");
+      const name = remote ? displayPath(item.path.replace(/\/+$/, "").split("/").pop()) :
+        item.label_key ? t(item.label_key) : displayPath(item.label);
+      const label = remote ? "smb " + name : name;
+      const suffix = item.available === false ?
+        t("diskUnavailable", { name: "" }) :
+        item.available === null ? t("diskSpaceUnknown", { name: "" }) :
+        t("diskSpace", { name: "", free: formatBytes(item.free, false),
+          total: formatBytes(item.total, false) });
+      option.textContent = label + suffix;
+      if (remote) {
+        option.smbName = name;
+        option.spaceSuffix = suffix;
+      }
+      option.title = item.path + " " + option.textContent;
+      if (item.label_key === "storageInternal") internalIndex = select.options.length;
+      if (item.current) currentIndex = select.options.length;
+      select.appendChild(option);
+    }
+    if (currentIndex < 0 && cwd.charAt(0) === "/") currentIndex = internalIndex;
+    select.selectedIndex = currentIndex;
+    select.addEventListener("change", async () => {
+      if (!select.value || spaceNavigationLocked()) {
+        select.selectedIndex = currentIndex;
+        fitSpaceOptions();
+        return;
+      }
+      const ok = await load(select.value, undefined, false, true, "seed");
+      if (!ok) select.selectedIndex = currentIndex;
+      fitSpaceOptions();
+    });
+    if (select.options.length) {
+      spaceInfoEl.appendChild(select);
+      fitSpaceOptions();
     }
     renderAddressPath();
+    if (!spaceNavigationLocked() && previousConnections.some(item => smbContainsPath(item.path, cwd)) &&
+        !smbConnections.some(item => smbContainsPath(item.path, cwd))) {
+      await load("/", undefined, true, true, "replace");
+    }
   } catch (err) {
     spaceInfoEl.textContent = "";
     renderAddressPath();
@@ -759,6 +874,176 @@ async function refreshSpaces() {
 function spaceNavigationLocked() {
   return Boolean(busy || loadingPath || !contentLoadingEl.hidden ||
     contentEl.classList.contains("loading"));
+}
+
+function readSmbPassword(item) {
+  let value = smbPasswords[item.path];
+  if (!value) {
+    try { value = JSON.parse(localStorage.getItem(SMB_PASSWORD_KEY + item.path)); } catch (err) {}
+  }
+  return value && value.user === item.user && value.domain === item.domain &&
+    typeof value.password === "string" ? value.password : null;
+}
+
+function saveSmbPassword(item, password) {
+  const value = { user: item.user, domain: item.domain, password: password };
+  smbPasswords[item.path] = value;
+  try { localStorage.setItem(SMB_PASSWORD_KEY + item.path, JSON.stringify(value)); } catch (err) {}
+}
+
+function forgetSmbPassword(path) {
+  delete smbPasswords[path];
+  delete smbReady[path];
+  try { localStorage.removeItem(SMB_PASSWORD_KEY + path); } catch (err) {}
+}
+
+function askSmbPassword(path) {
+  const password = prompt(t("smbPasswordPrompt", { path: displayPath(path) }), "");
+  if (typeof password !== "string") {
+    const error = new Error(t("smbPasswordCanceled"));
+    error.code = "smb_password_canceled";
+    throw error;
+  }
+  return password;
+}
+
+async function unlockSmb(item) {
+  let password = readSmbPassword(item);
+  const guest = /^(guest|anonymous)$/i.test(item.user || "Guest");
+  if (password === null && !guest) password = askSmbPassword(item.path);
+  try {
+    let data;
+    try {
+      data = await apiForm("/api/smb/connect", { address: item.path, password: password === null ? "" : password });
+    } catch (err) {
+      if (password !== null || err.code !== "smb_password_required") throw err;
+      password = askSmbPassword(item.path);
+      data = await apiForm("/api/smb/connect", { address: item.path, password: password });
+    }
+    saveSmbPassword(data, password === null ? "" : password);
+  } catch (err) {
+    forgetSmbPassword(item.path);
+    throw err;
+  }
+}
+
+async function ensureSmbPaths(values) {
+  const paths = [];
+  for (const key of Object.keys(values || {})) {
+    const value = values[key];
+    if (typeof value === "string") paths.push.apply(paths, value.split("\n").filter(path => /^smb:\/\//.test(path)));
+  }
+  if (!paths.length) return;
+  if (!smbConnections.length) {
+    const data = await api("/api/space");
+    smbConnections = (data.spaces || []).filter(item => /^smb:\/\//.test(item.path || ""));
+  }
+  for (const path of paths) {
+    const item = smbConnections.filter(item => smbContainsPath(item.path, path))
+      .sort((a, b) => b.path.length - a.path.length)[0];
+    if (!item) continue;
+    if (!smbReady[item.path]) smbReady[item.path] = unlockSmb(item);
+    try { await smbReady[item.path]; }
+    catch (err) { delete smbReady[item.path]; throw err; }
+  }
+}
+
+function smbContainsPath(root, path) {
+  return path === root || path.indexOf(root + "/") === 0;
+}
+
+function renderSmbConnections() {
+  smbConnectionListEl.textContent = "";
+  if (!smbConnections.length) {
+    const empty = document.createElement("div");
+    empty.className = "smb-connections-empty";
+    empty.textContent = t("smbConnectionsEmpty");
+    smbConnectionListEl.appendChild(empty);
+  }
+  for (const item of smbConnections) {
+    const row = document.createElement("div");
+    row.className = "smb-connection-row";
+    const path = document.createElement("span");
+    path.className = "smb-connection-path";
+    path.textContent = displayPath(item.path);
+    row.appendChild(path);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "danger";
+    remove.textContent = t("removeSmb");
+    remove.setAttribute("aria-label", t("removeSmb") + " " + displayPath(item.path));
+    remove.addEventListener("click", () => removeSmbConnection(item.path));
+    row.appendChild(remove);
+    smbConnectionListEl.appendChild(row);
+  }
+  updateButtons();
+}
+
+function openSmbManager() {
+  if (spaceNavigationLocked()) return;
+  smbManagerOverlayEl.hidden = false;
+  renderSmbConnections();
+  smbManagerAddBtn.focus();
+  refreshSpaces();
+}
+
+function closeSmbManager() {
+  if (localActionBusy) return;
+  smbManagerOverlayEl.hidden = true;
+  manageSmbBtn.focus();
+}
+
+async function removeSmbConnection(path) {
+  if (spaceNavigationLocked() || !confirm(t("smbRemoveConfirm", { path: displayPath(path) }))) return;
+  try {
+    localActionBusy = true;
+    setBusy(true);
+    await apiForm("/api/smb/remove", { path: path });
+    forgetSmbPassword(path);
+    if (smbContainsPath(path, cwd)) await load("/", undefined, true, true, "replace");
+    await refreshSpaces();
+  } catch (err) {
+    alert(t("smbRemoveFailed", { error: err.message }));
+  } finally {
+    localActionBusy = false;
+    setBusy(false);
+    renderSmbConnections();
+    smbManagerAddBtn.focus();
+  }
+}
+
+async function addSmbConnection() {
+  if (spaceNavigationLocked()) return;
+  const address = prompt(t("smbAddressPrompt"), "smb://");
+  if (typeof address !== "string") return;
+  const input = address.trim();
+  if (!input || /^smb:\/\/$/i.test(input)) return;
+  try {
+    localActionBusy = true;
+    setBusy(true);
+    const authority = /^smb:\/\/([^/]+)\//.exec(input);
+    let clean = input;
+    let password = "";
+    if (authority && authority[1].indexOf("@") >= 0) {
+      const at = authority[1].lastIndexOf("@");
+      const credentials = authority[1].slice(0, at);
+      const colon = credentials.indexOf(":");
+      password = colon >= 0 ? decodeURIComponent(credentials.slice(colon + 1)) : askSmbPassword(input);
+      if (colon >= 0) clean = input.replace(authority[1], credentials.slice(0, colon) + "@" + authority[1].slice(at + 1));
+    }
+    const data = await apiForm("/api/smb/add", { address: clean, password: password });
+    saveSmbPassword(data, password);
+    smbReady[data.path] = Promise.resolve();
+    await refreshSpaces();
+    await load(data.path, undefined, true, true, "seed");
+    smbManagerOverlayEl.hidden = true;
+  } catch (err) {
+    if (err.code !== "smb_password_canceled") alert(t("smbConnectFailed", { error: err.message }));
+  } finally {
+    localActionBusy = false;
+    setBusy(false);
+    if (smbManagerOverlayEl.hidden) manageSmbBtn.focus();
+  }
 }
 
 function updateSpecialStoragePaths(spaces) {
@@ -1508,8 +1793,14 @@ function singleSelected() {
 function updateButtons() {
   const items = selectedEntries();
   const locked = busy || contentEl.classList.contains("loading");
-  for (const button of spaceInfoEl.querySelectorAll(".space-item")) {
+  manageSmbBtn.disabled = spaceNavigationLocked();
+  smbManagerAddBtn.disabled = spaceNavigationLocked();
+  smbManagerCloseBtn.disabled = localActionBusy;
+  for (const button of smbConnectionListEl.querySelectorAll("button")) {
     button.disabled = spaceNavigationLocked();
+  }
+  for (const select of spaceInfoEl.querySelectorAll(".space-select")) {
+    select.disabled = spaceNavigationLocked();
   }
   document.getElementById("copyBtn").disabled = locked || items.length === 0;
   document.getElementById("moveBtn").disabled = locked || items.length === 0;
@@ -1522,7 +1813,9 @@ function updateButtons() {
   uploadFolderBtn.disabled = locked;
   document.getElementById("mkdirBtn").disabled = locked;
   newTextBtn.disabled = locked;
-  for (const button of filesEl.querySelectorAll(".row-action, .mode-action")) button.disabled = locked;
+  for (const button of filesEl.querySelectorAll(".row-action, .mode-action")) {
+    button.disabled = locked || (/^smb:\/\//.test(cwd) && button.classList.contains("mode-action"));
+  }
   for (const checkbox of filesEl.querySelectorAll(".select-cell input")) checkbox.disabled = locked;
   selectAllEl.disabled = locked;
   nameFilterBtn.disabled = locked;
@@ -1718,10 +2011,11 @@ function render() {
     const modeBtn = document.createElement("button");
     modeBtn.className = "mode-action";
     modeBtn.type = "button";
-    modeBtn.textContent = permissionModeText(item.mode);
-    modeBtn.title = t("permissionChangeTitle", { name: displayName(item) });
+    const remote = /^smb:\/\//.test(item.path);
+    modeBtn.textContent = remote ? "—" : permissionModeText(item.mode);
+    modeBtn.title = remote ? t("smbPermissions") : t("permissionChangeTitle", { name: displayName(item) });
     modeBtn.setAttribute("aria-label", modeBtn.title);
-    modeBtn.disabled = busy || Boolean(loadingPath);
+    modeBtn.disabled = remote || busy || Boolean(loadingPath);
     modeBtn.addEventListener("click", event => {
       event.preventDefault();
       event.stopPropagation();
@@ -1747,6 +2041,7 @@ function render() {
 
 function parentPath(path) {
   if (path === "/") return "/";
+  if (/^smb:\/\/[^/]+\/[^/]+\/?$/.test(path)) return "/";
   const parts = path.replace(/\/+$/, "").split("/");
   parts.pop();
   return parts.join("/") || "/";
@@ -1798,7 +2093,8 @@ async function load(path, scrollTop, force, alertOnError, historyMode) {
     cwd = data.path;
     renderAddressPath();
     savePath(cwd);
-    if (historyMode) writeHistoryPath(cwd, historyMode === "replace");
+    if (historyMode === "seed") seedHistoryPath(cwd);
+    else if (historyMode) writeHistoryPath(cwd, historyMode === "replace");
     refreshSpaces();
     entries = data.entries.sort(compareEntries);
     selected.clear();
@@ -1809,7 +2105,7 @@ async function load(path, scrollTop, force, alertOnError, historyMode) {
     return true;
   } catch (err) {
     setStatus(err.message);
-    if (alertOnError) alert(err.message);
+    if (alertOnError && err.code !== "smb_password_canceled") alert(err.message);
     return false;
   } finally {
     loadingPath = null;
@@ -2638,6 +2934,12 @@ pkgInfoImageEl.addEventListener("error", () => {
     pkgInfoImageEl.src = "/icon-pkg.png";
   }
 });
+manageSmbBtn.addEventListener("click", openSmbManager);
+smbManagerAddBtn.addEventListener("click", addSmbConnection);
+smbManagerCloseBtn.addEventListener("click", closeSmbManager);
+smbManagerOverlayEl.addEventListener("click", event => {
+  if (event.target === smbManagerOverlayEl) closeSmbManager();
+});
 permissionCancelBtn.addEventListener("click", requestClosePermissionDialog);
 permissionApplyBtn.addEventListener("click", applyPermissionMode);
 extractCancelBtn.addEventListener("click", closeExtractDialog);
@@ -2651,6 +2953,7 @@ permissionModeEl.addEventListener("input", () => {
 permissionModeEl.addEventListener("change", validatePermissionMode);
 for (const checkbox of permissionChecks) checkbox.addEventListener("change", syncPermissionMode);
 window.addEventListener("resize", () => {
+  fitSpaceOptions();
   renderAddressPath();
   renderSinglePermissionPath();
   renderSingleExtractPath();
@@ -2693,9 +2996,25 @@ document.addEventListener("click", event => {
   uploadMenuEl.classList.remove("open");
 });
 document.addEventListener("keydown", event => {
+  if (!smbManagerOverlayEl.hidden && (event.key === "Tab" || event.keyCode === 9)) {
+    const buttons = smbManagerOverlayEl.querySelectorAll("button:not(:disabled)");
+    if (!buttons.length) { event.preventDefault(); return; }
+    const first = buttons[0];
+    const last = buttons[buttons.length - 1];
+    if (event.shiftKey && (document.activeElement === first || !smbManagerOverlayEl.contains(document.activeElement))) {
+      first.blur();
+      last.focus();
+      event.preventDefault();
+    } else if (!event.shiftKey && (document.activeElement === last || !smbManagerOverlayEl.contains(document.activeElement))) {
+      first.focus();
+      event.preventDefault();
+    }
+    return;
+  }
   if (event.key !== "Escape" && event.keyCode !== 27) return;
   let handled = true;
-  if (!extractOverlayEl.hidden) closeExtractDialog();
+  if (!smbManagerOverlayEl.hidden) closeSmbManager();
+  else if (!extractOverlayEl.hidden) closeExtractDialog();
   else if (!permissionOverlayEl.hidden) requestClosePermissionDialog();
   else if (!pkgInfoOverlayEl.hidden) closePkgInfo();
   else if (!imagePreviewOverlayEl.hidden) closeImagePreview();

@@ -13,6 +13,7 @@
 #include "json_util.h"
 #include "path_util.h"
 #include "websrv.h"
+#include "vfs.h"
 
 #define PKG_CNT_MAGIC 0x7f434e54u
 #define PKG_FIH_MAGIC 0x7f464948u
@@ -46,6 +47,7 @@ typedef struct pkg_source {
   uint64_t param_offset;
   uint32_t param_size;
   pkg_param_type_t param_type;
+  int platform;
   uint64_t icon_offset;
   uint32_t icon_size;
 } pkg_source_t;
@@ -151,6 +153,7 @@ pkg_source_open(const char *path, pkg_source_t *pkg) {
 
   pkg->size = (uint64_t)st.st_size;
   magic = read_be32(header);
+  pkg->platform = magic == PKG_FIH_MAGIC || magic == PKG_LIH_MAGIC ? 5 : 4;
   if(magic == PKG_FIH_MAGIC) {
     container_offset = read_le64(header + 0x58);
   } else if(magic == PKG_LIH_MAGIC) {
@@ -189,7 +192,8 @@ pkg_source_open(const char *path, pkg_source_t *pkg) {
 
     if(!range_valid(offset, size, container_size)) goto done;
     if(encrypted || !size) continue;
-    if(id == PKG_ENTRY_PARAM_SFO && size <= PKG_PARAM_MAX) {
+    if(id == PKG_ENTRY_PARAM_SFO && size <= PKG_PARAM_MAX &&
+       (!pkg->param_size || pkg->param_type == PKG_PARAM_SFO)) {
       pkg->param_offset = container_offset + offset;
       pkg->param_size = size;
       pkg->param_type = PKG_PARAM_SFO;
@@ -197,6 +201,7 @@ pkg_source_open(const char *path, pkg_source_t *pkg) {
       pkg->param_offset = container_offset + offset;
       pkg->param_size = size;
       pkg->param_type = PKG_PARAM_JSON;
+      pkg->platform = 5;
     } else if(id >= PKG_ENTRY_ICON0_PNG &&
               id <= PKG_ENTRY_ICON0_LOCALIZED_LAST &&
               size <= PKG_ICON_MAX &&
@@ -220,7 +225,7 @@ done:
 }
 
 static int
-append_sfo_fields(strbuf_t *json, const unsigned char *sfo, size_t size) {
+append_sfo_fields(strbuf_t *json, const unsigned char *sfo, size_t size, pkg_details_t *details) {
   uint32_t key_offset;
   uint32_t value_offset;
   uint32_t count;
@@ -265,6 +270,10 @@ append_sfo_fields(strbuf_t *json, const unsigned char *sfo, size_t size) {
       value = strdup(number);
     }
     if(!value) continue;
+    if(details && !strcmp((const char *)sfo + key_pos, "TITLE") && strlen(value) < sizeof(details->title))
+      strcpy(details->title, value);
+    if(details && !strcmp((const char *)sfo + key_pos, "CONTENT_ID") && strlen(value) == 36)
+      strcpy(details->content_id, value);
     if(!first) strbuf_append(json, ",");
     first = 0;
     strbuf_append(json, "{\"name\":");
@@ -430,9 +439,67 @@ append_named_json_field(strbuf_t *json, const char *name,
   strbuf_append(json, "}");
 }
 
+/* Decode JSON strings for native metadata, including UTF-16 surrogate pairs. */
+static int
+copy_json_string(char *out, size_t capacity, const unsigned char *data, const json_token_t *token) {
+  if(token->type != JSON_STRING) return -1;
+  size_t used = 0;
+  for(size_t i = token->start; i < token->end; i++) {
+    unsigned char bytes[4];
+    size_t length = 1;
+    bytes[0] = data[i];
+    if(data[i] == '\\') {
+      if(++i >= token->end) return -1;
+      if(data[i] == 'u') {
+        unsigned int cp = 0;
+        for(int part = 0; part < 2; part++) {
+          unsigned int unit = 0;
+          for(int n = 0; n < 4; n++) {
+            if(++i >= token->end) return -1;
+            unsigned char c = data[i];
+            if(!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return -1;
+            unit = unit * 16 + (c <= '9' ? c - '0' : (c | 32) - 'a' + 10);
+          }
+          if(!part && unit >= 0xd800 && unit <= 0xdbff) {
+            cp = unit;
+            if(i + 2 >= token->end || data[++i] != '\\' || data[++i] != 'u') return -1;
+            continue;
+          }
+          if(part) {
+            if(unit < 0xdc00 || unit > 0xdfff) return -1;
+            cp = 0x10000 + ((cp - 0xd800) << 10) + unit - 0xdc00;
+          } else {
+            if(unit >= 0xdc00 && unit <= 0xdfff) return -1;
+            cp = unit;
+          }
+          break;
+        }
+        if(!cp) return -1;
+        if(cp < 0x80) bytes[0] = (unsigned char)cp;
+        else if(cp < 0x800) {
+          length = 2; bytes[0] = 0xc0 | (cp >> 6); bytes[1] = 0x80 | (cp & 63);
+        } else if(cp < 0x10000) {
+          length = 3; bytes[0] = 0xe0 | (cp >> 12); bytes[1] = 0x80 | ((cp >> 6) & 63); bytes[2] = 0x80 | (cp & 63);
+        } else {
+          length = 4; bytes[0] = 0xf0 | (cp >> 18); bytes[1] = 0x80 | ((cp >> 12) & 63);
+          bytes[2] = 0x80 | ((cp >> 6) & 63); bytes[3] = 0x80 | (cp & 63);
+        }
+      } else {
+        const char *keys = "bfnrt";
+        const char *escape = strchr(keys, data[i]);
+        bytes[0] = escape ? (unsigned char)"\b\f\n\r\t"[escape - keys] : data[i];
+      }
+    }
+    if(used + length >= capacity) return -1;
+    memcpy(out + used, bytes, length); used += length;
+  }
+  out[used] = 0;
+  return 0;
+}
+
 static int
 append_param_json_fields(strbuf_t *json, const unsigned char *data,
-                         size_t size) {
+                         size_t size, pkg_details_t *details) {
   json_token_t *tokens = calloc(JSON_TOKEN_MAX, sizeof(*tokens));
   size_t count = 0;
   int first = 1;
@@ -478,6 +545,7 @@ append_param_json_fields(strbuf_t *json, const unsigned char *data,
   }
   if(title >= 0 && tokens[title].type == JSON_STRING) {
     append_named_json_field(json, "titleName", data, &tokens[title], &first);
+    if(details && copy_json_string(details->title, sizeof(details->title), data, &tokens[title])) details->title[0] = 0;
   }
 
   for(int item = json_next_child(tokens, count, 0, 1); item >= 0;) {
@@ -490,9 +558,42 @@ append_param_json_fields(strbuf_t *json, const unsigned char *data,
     }
     item = json_next_child(tokens, count, 0, (size_t)value + 1);
   }
+  if(details) {
+    int id = json_object_value(data, tokens, count, 0, "contentId");
+    char content_id[37];
+    if(id >= 0 && !copy_json_string(content_id, sizeof(content_id), data, &tokens[id]) && strlen(content_id) == 36)
+      strcpy(details->content_id, content_id);
+    if(!details->title[0]) {
+      int name = json_object_value(data, tokens, count, 0, "titleName");
+      if(name >= 0 && copy_json_string(details->title, sizeof(details->title), data, &tokens[name])) details->title[0] = 0;
+    }
+  }
   strbuf_append(json, "]");
   free(tokens);
   return 0;
+}
+
+int
+pkg_read_details(const char *path, pkg_details_t *details) {
+  pkg_source_t pkg = {.fd = -1};
+  strbuf_t fields = {0};
+  unsigned char *param = NULL;
+  int result = -1;
+  memset(details, 0, sizeof(*details));
+  if(pkg_source_open(path, &pkg)) return -1;
+  if(!(param = malloc(pkg.param_size)) || read_at(pkg.fd, param, pkg.param_size, pkg.param_offset)) goto done;
+  details->platform = pkg.platform;
+  details->has_icon = pkg.icon_size != 0;
+  memcpy(details->content_id, pkg.content_id, sizeof(details->content_id));
+  result = pkg.param_type == PKG_PARAM_JSON ?
+    append_param_json_fields(&fields, param, pkg.param_size, details) :
+    append_sfo_fields(&fields, param, pkg.param_size, details);
+  if(strlen(details->content_id) != 36 || strspn(details->content_id,
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") != 36) details->content_id[0] = 0;
+done:
+  free(fields.data); free(param); pkg_source_close(&pkg);
+  if(result) memset(details, 0, sizeof(*details));
+  return result;
 }
 
 static enum MHD_Result
@@ -530,13 +631,13 @@ api_pkg_info(struct MHD_Connection *conn) {
   strbuf_printf(&json,
                 ",\"platform\":\"%s\",\"content_type\":%u,"
                 "\"content_flags\":%u,\"has_icon\":%s,\"fields\":",
-                pkg.param_type == PKG_PARAM_JSON ? "PS5" : "PS4",
+                pkg.platform == 5 ? "PS5" : "PS4",
                 pkg.content_type, pkg.content_flags,
                 pkg.icon_size ? "true" : "false");
   if((pkg.param_type == PKG_PARAM_JSON &&
-      append_param_json_fields(&json, param, pkg.param_size)) ||
+      append_param_json_fields(&json, param, pkg.param_size, NULL)) ||
      (pkg.param_type == PKG_PARAM_SFO &&
-      append_sfo_fields(&json, param, pkg.param_size))) {
+      append_sfo_fields(&json, param, pkg.param_size, NULL))) {
     enum MHD_Result ret;
     free(json.data);
     ret = pkg_error(conn, path);
@@ -554,29 +655,26 @@ api_pkg_info(struct MHD_Connection *conn) {
 }
 
 enum MHD_Result
-api_pkg_icon(struct MHD_Connection *conn) {
-  char *path = fs_path_value(query_value(conn, "path"));
+pkg_icon_response(struct MHD_Connection *conn, const char *path) {
   pkg_source_t pkg = {.fd = -1};
-  unsigned char *icon;
+  unsigned char *icon = NULL;
   struct MHD_Response *response;
   enum MHD_Result ret;
 
   if(!path || pkg_source_open(path, &pkg) || !pkg.icon_size ||
      !(icon = malloc(pkg.icon_size)) ||
      read_at(pkg.fd, icon, pkg.icon_size, pkg.icon_offset)) {
+    free(icon);
     if(path && pkg.fd >= 0) pkg_source_close(&pkg);
-    free(path);
     return send_json_error(conn, MHD_HTTP_NOT_FOUND, "package icon not found");
   }
   if(!png_signature_valid(icon, pkg.icon_size)) {
     free(icon);
     pkg_source_close(&pkg);
-    free(path);
     return send_json_error(conn, MHD_HTTP_NOT_FOUND,
                            "package icon not found");
   }
   pkg_source_close(&pkg);
-  free(path);
 
   response = MHD_create_response_from_buffer(pkg.icon_size, icon,
                                               MHD_RESPMEM_MUST_FREE);
@@ -588,4 +686,12 @@ api_pkg_icon(struct MHD_Connection *conn) {
   ret = websrv_queue_response(conn, MHD_HTTP_OK, response);
   MHD_destroy_response(response);
   return ret;
+}
+
+enum MHD_Result
+api_pkg_icon(struct MHD_Connection *conn) {
+  char *path = fs_path_value(query_value(conn, "path"));
+  enum MHD_Result result = pkg_icon_response(conn, path);
+  free(path);
+  return result;
 }

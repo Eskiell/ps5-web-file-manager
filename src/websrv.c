@@ -14,51 +14,23 @@
 #include "asset.h"
 #include "filemgr.h"
 #include "websrv.h"
+#include "transfer.h"
 
 #define REQUEST_BODY_MAX (4 * 1024 * 1024)
 #define HTTP_CONNECTION_MEMORY_LIMIT (8 * 1024 * 1024)
 #define HTTP_CONNECTION_MEMORY_INCREMENT (2 * 1024 * 1024)
-#define HTTP_SOCKET_RCVBUF_SIZE (4 * 1024 * 1024)
-#define HTTP_SOCKET_SNDBUF_SIZE (4 * 1024 * 1024)
 
 static volatile sig_atomic_t g_stop_requested;
 static int g_listen_fd = -1;
 
 static void
-websrv_set_socket_option(int fd, int level, int option, int value,
-                         const char *name) {
-  if(setsockopt(fd, level, option, &value, sizeof(value)) < 0) {
-    fprintf(stderr, "HTTP socket fd=%d %s requested=%d failed: %s\n",
-            fd, name, value, strerror(errno));
-  }
-}
-
-static void
-websrv_log_socket_buffers(int fd, const char *kind) {
-  const int options[] = { SO_RCVBUF, SO_SNDBUF };
-  const char *names[] = { "SO_RCVBUF", "SO_SNDBUF" };
-  size_t i;
-  for(i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
-    int value = 0;
-    socklen_t size = sizeof(value);
-    if(getsockopt(fd, SOL_SOCKET, options[i], &value, &size) < 0) {
-      fprintf(stderr, "HTTP %s fd=%d get %s failed: %s\n",
-              kind, fd, names[i], strerror(errno));
-    } else {
-      printf("HTTP %s fd=%d %s actual=%d bytes\n", kind, fd, names[i], value);
-    }
-  }
-}
-
-static void
 websrv_tune_connection_socket(int fd) {
-  const int sndbuf = HTTP_SOCKET_SNDBUF_SIZE;
+  const int sndbuf = TRANSFER_SOCKET_BUFFER_SIZE;
   const int nodelay = 1;
 
   /* OrbisOS HTTP sockets need an explicit send buffer to fill a GbE link. */
-  websrv_set_socket_option(fd, SOL_SOCKET, SO_SNDBUF, sndbuf, "SO_SNDBUF");
-  websrv_set_socket_option(fd, IPPROTO_TCP, TCP_NODELAY, nodelay, "TCP_NODELAY");
-  websrv_log_socket_buffers(fd, "connection");
+  transfer_socket_option(fd, SOL_SOCKET, SO_SNDBUF, sndbuf, "HTTP", "SO_SNDBUF");
+  transfer_socket_option(fd, IPPROTO_TCP, TCP_NODELAY, nodelay, "HTTP", "TCP_NODELAY");
 }
 
 typedef struct request_context {
@@ -182,6 +154,9 @@ websrv_on_request(void *cls, struct MHD_Connection *conn, const char *url,
   if(!strncmp(url, "/api/", 5)) {
     return filemgr_api_request(conn, url, method, ctx->body, ctx->size);
   }
+  if(!strncmp(url, "/pkg-source/", strlen("/pkg-source/"))) {
+    return filemgr_pkg_source_request(conn, url, method);
+  }
   if(!strcmp(url, "/fs")) {
     return filemgr_fs_request(conn);
   }
@@ -234,11 +209,10 @@ websrv_listen(unsigned short port) {
     return -1;
   }
   {
-    const int rcvbuf = HTTP_SOCKET_RCVBUF_SIZE;
+    const int rcvbuf = TRANSFER_SOCKET_BUFFER_SIZE;
 
     /* Set before listen so accepted PS5 sockets inherit the larger window. */
-    websrv_set_socket_option(srvfd, SOL_SOCKET, SO_RCVBUF, rcvbuf, "SO_RCVBUF");
-    websrv_log_socket_buffers(srvfd, "listener");
+    transfer_socket_option(srvfd, SOL_SOCKET, SO_RCVBUF, rcvbuf, "HTTP", "SO_RCVBUF");
   }
 
   memset(&server_addr, 0, sizeof(server_addr));
@@ -292,4 +266,11 @@ websrv_listen(unsigned short port) {
   MHD_stop_daemon(httpd);
   g_listen_fd = -1;
   return close(srvfd);
+}
+
+unsigned short websrv_port(void) {
+  struct sockaddr_in address;
+  socklen_t size = sizeof(address);
+  return g_listen_fd >= 0 && !getsockname(g_listen_fd, (struct sockaddr *)&address, &size) ?
+    ntohs(address.sin_port) : 0;
 }

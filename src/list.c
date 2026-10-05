@@ -10,6 +10,7 @@
 
 #include "json_util.h"
 #include "path_util.h"
+#include "vfs.h"
 
 static char
 mode_type(const struct stat *st) {

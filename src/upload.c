@@ -13,6 +13,8 @@
 #include "filemgr_internal.h"
 #include "json_util.h"
 #include "path_util.h"
+#include "vfs.h"
+#include "transfer.h"
 
 #define UPLOAD_BUFFER_SIZE (1024 * 1024)
 
@@ -56,27 +58,8 @@ upload_error_message(upload_context_t *ctx) {
 
 static int
 upload_write(upload_context_t *ctx, const char *data, size_t size) {
-  size_t written = 0;
-
-  while(written < size) {
-    ssize_t n;
-
-    if(ctx->task && task_cancel_requested(ctx->task)) {
-      return ECANCELED;
-    }
-    n = write(ctx->fd, data + written, size - written);
-    if(n < 0 && errno == EINTR) continue;
-    if(n <= 0) {
-      return n < 0 ? errno : EIO;
-    }
-    written += (size_t)n;
-    ctx->written += (unsigned long long)n;
-  }
-  if(ctx->task && written) {
-    task_update(ctx->task, TASK_RUNNING, ctx->target,
-                (unsigned long long)written, NULL);
-  }
-  return 0;
+  return transfer_write_all(ctx->task, ctx->fd, ctx->target, data, size,
+                            &ctx->written) ? errno : 0;
 }
 
 static void *
@@ -516,13 +499,14 @@ filemgr_upload_begin(struct MHD_Connection *conn, void **upload_ctx) {
     goto fail;
   }
   ctx->stage = "allocating upload buffer";
+  wfm_set_transfer_size(ctx->fd, ctx->expected);
   if(!(ctx->buffer = malloc(UPLOAD_BUFFER_SIZE))) {
     ctx->failed = 1;
     ctx->error = ENOMEM;
     goto fail;
   }
   /* Two bounded buffers overlap reception and writes; fall back on init failure. */
-  if(ctx->expected >= UPLOAD_BUFFER_SIZE) upload_writer_start(ctx);
+  if(transfer_use_pipeline(ctx->expected)) upload_writer_start(ctx);
 
 fail:
   free_paths(checked_dirs, checked_dir_count);

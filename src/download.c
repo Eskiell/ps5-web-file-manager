@@ -13,10 +13,11 @@
 #include "filemgr_internal.h"
 #include "json_util.h"
 #include "path_util.h"
+#include "vfs.h"
 #include "websrv.h"
+#include "transfer.h"
 
 #define DOWNLOAD_ARCHIVE_NAME_LIMIT 20
-#define DOWNLOAD_BUFFER_SIZE (2 * 1024 * 1024)
 
 typedef struct tar_frame {
   char path[PATH_MAX];
@@ -34,6 +35,8 @@ typedef struct tar_stream {
   size_t stack_depth;
   tar_frame_t *stack;
   int fd;
+  transfer_reader_t *reader;
+  uint64_t file_position;
   char current_file[PATH_MAX];
   unsigned long long file_remaining;
   size_t file_padding;
@@ -49,6 +52,8 @@ typedef struct tar_stream {
 typedef struct download_file_stream {
   file_task_t *task;
   int fd;
+  transfer_reader_t *reader;
+  int reader_initialized;
   unsigned long long size;
   unsigned long long sent;
   int done;
@@ -215,7 +220,14 @@ tar_start_path(tar_stream_t *s, const char *path, const char *name) {
   }
   snprintf(s->current_file, sizeof(s->current_file), "%s", path);
   s->file_remaining = (unsigned long long)st.st_size;
+  s->file_position = 0;
+  s->reader = transfer_http_reader_start(s->fd, 0, s->file_remaining, s->file_remaining, s->task);
   s->file_padding = (size_t)((512 - ((unsigned long long)st.st_size % 512)) % 512);
+  if(!s->file_remaining) {
+    close(s->fd);
+    s->fd = -1;
+    s->current_file[0] = 0;
+  }
   return 0;
 }
 
@@ -329,26 +341,26 @@ tar_read(void *cls, uint64_t pos, char *buf, size_t max) {
       if((unsigned long long)want > s->file_remaining) {
         want = (size_t)s->file_remaining;
       }
-      n = read(s->fd, buf + out, want);
+      n = transfer_read_at(s->reader, s->fd, buf + out, want, s->file_position);
       if(n < 0) {
         s->error = errno;
         return out ? (ssize_t)out : MHD_CONTENT_READER_END_WITH_ERROR;
       }
       if(!n) {
-        close(s->fd);
-        s->fd = -1;
-        s->current_file[0] = 0;
-        s->file_remaining = 0;
-        continue;
+        s->error = EIO;
+        return out ? (ssize_t)out : MHD_CONTENT_READER_END_WITH_ERROR;
       }
       out += (size_t)n;
       s->file_remaining -= (unsigned long long)n;
+      s->file_position += (unsigned long long)n;
       progress += (unsigned long long)n;
       if(s->current_file[0]) {
         snprintf(progress_current, sizeof(progress_current), "%s",
                  s->current_file);
       }
       if(!s->file_remaining) {
+        transfer_reader_close(s->reader);
+        s->reader = NULL;
         close(s->fd);
         s->fd = -1;
         s->current_file[0] = 0;
@@ -373,6 +385,7 @@ tar_close(void *cls) {
   if(!s) {
     return;
   }
+  transfer_reader_close(s->reader);
   if(s->fd >= 0) {
     close(s->fd);
   }
@@ -603,14 +616,20 @@ download_file_read(void *cls, uint64_t pos, char *buf, size_t max) {
     s->error = ECANCELED;
     return MHD_CONTENT_READER_END_WITH_ERROR;
   }
-  len = pread(s->fd, buf, max, (off_t)pos);
+  if(pos >= s->size) { s->done = 1; return MHD_CONTENT_READER_END_OF_STREAM; }
+  if(max > s->size - pos) max = (size_t)(s->size - pos);
+  if(!s->reader_initialized) {
+    s->reader = transfer_http_reader_start(s->fd, pos, s->size - pos, s->size, s->task);
+    s->reader_initialized = 1;
+  }
+  len = transfer_read_at(s->reader, s->fd, buf, max, pos);
   if(len < 0) {
     s->error = errno ? errno : EIO;
     return MHD_CONTENT_READER_END_WITH_ERROR;
   }
   if(!len) {
-    s->done = 1;
-    return MHD_CONTENT_READER_END_OF_STREAM;
+    s->error = EIO;
+    return MHD_CONTENT_READER_END_WITH_ERROR;
   }
   {
     unsigned long long end = (unsigned long long)pos + (unsigned long long)len;
@@ -634,6 +653,7 @@ download_file_close(void *cls) {
   if(!s) {
     return;
   }
+  transfer_reader_close(s->reader);
   if(s->fd >= 0) {
     close(s->fd);
   }
@@ -706,7 +726,8 @@ api_download(struct MHD_Connection *conn) {
       return send_json_error(conn, MHD_HTTP_NOT_FOUND, "file not found");
     }
     resp = MHD_create_response_from_callback((uint64_t)st.st_size,
-                                             DOWNLOAD_BUFFER_SIZE,
+                                             file_stream->size < TRANSFER_HTTP_BUFFER_SIZE ?
+                                               (file_stream->size ? (size_t)file_stream->size : 1) : TRANSFER_HTTP_BUFFER_SIZE,
                                              download_file_read, file_stream,
                                              download_file_close);
     if(!resp) {
@@ -745,7 +766,7 @@ api_download(struct MHD_Connection *conn) {
     }
   }
   resp = MHD_create_response_from_callback(MHD_SIZE_UNKNOWN,
-                                           DOWNLOAD_BUFFER_SIZE,
+                                           TRANSFER_HTTP_BUFFER_SIZE,
                                            tar_read, stream, tar_close);
   if(!resp) {
     tar_close(stream);

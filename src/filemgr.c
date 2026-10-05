@@ -28,14 +28,10 @@
 #include "pkg_info.h"
 #include "pkg_installer.h"
 #include "websrv.h"
+#include "smb.h"
+#include "vfs.h"
+#include "transfer.h"
 
-#define COPY_BUFFER_SIZE (8 * 1024 * 1024)
-#define COPY_PIPELINE_SLOTS 3
-#define FILEMGR_AGGRESSIVE_COPY 0
-#define FILEMGR_PIPELINE_COPY 1
-#define SMALL_COPY_WORKERS 3
-#define FILE_TASK_QUEUE_LIMIT 128
-#define LARGE_FILE_THRESHOLD (256LL * 1024 * 1024)
 #define TRANSFER_ALERT_THRESHOLD (10 * 60)
 
 #ifndef __linux__
@@ -103,52 +99,6 @@ typedef struct task_completion {
 
 static int ensure_copy_dir(const char *path);
 static int open_copy_temp(const char *dst, char *temp, size_t temp_size);
-#if FILEMGR_PIPELINE_COPY
-typedef struct copy_pipeline_slot {
-  char *data;
-  size_t size;
-  int ready;
-} copy_pipeline_slot_t;
-
-typedef struct copy_pipeline {
-  file_task_t *task;
-  int in;
-  copy_pipeline_slot_t slots[COPY_PIPELINE_SLOTS];
-  pthread_mutex_t lock;
-  pthread_cond_t can_read;
-  pthread_cond_t can_write;
-  int read_index;
-  int write_index;
-  int done;
-  int error;
-  int error_number;
-} copy_pipeline_t;
-#endif
-
-#if FILEMGR_AGGRESSIVE_COPY
-typedef struct copy_job {
-  char src[PATH_MAX];
-  char dst[PATH_MAX];
-  struct copy_job *next;
-} copy_job_t;
-
-typedef struct copy_queue {
-  file_task_t *task;
-  pthread_mutex_t lock;
-  pthread_cond_t has_work;
-  pthread_cond_t has_space;
-  pthread_cond_t idle;
-  pthread_t workers[SMALL_COPY_WORKERS];
-  copy_job_t *head;
-  copy_job_t *tail;
-  int queued;
-  int active;
-  int stopping;
-  int error;
-  int error_number;
-  int worker_count;
-} copy_queue_t;
-#endif
 
 static task_completion_t g_last_completion;
 #ifndef __linux__
@@ -391,289 +341,7 @@ count_path_bytes_sync(file_task_t *task, const char *path, const char *display,
   return 0;
 }
 
-#if FILEMGR_AGGRESSIVE_COPY
-typedef struct count_job {
-  char path[PATH_MAX];
-  char display[PATH_MAX];
-  int has_display;
-  struct count_job *next;
-} count_job_t;
-
-typedef struct count_queue {
-  file_task_t *task;
-  pthread_mutex_t lock;
-  pthread_cond_t has_work;
-  pthread_cond_t has_space;
-  pthread_cond_t idle;
-  pthread_t workers[SMALL_COPY_WORKERS];
-  count_job_t *head;
-  count_job_t *tail;
-  int queued;
-  int active;
-  int stopping;
-  int error;
-  int error_number;
-  int worker_count;
-  unsigned long long total;
-  size_t file_count;
-  size_t dir_count;
-} count_queue_t;
-
-static void
-count_queue_add(count_queue_t *queue, unsigned long long total, size_t file_count,
-                size_t dir_count) {
-  pthread_mutex_lock(&queue->lock);
-  queue->total += total;
-  queue->file_count += file_count;
-  queue->dir_count += dir_count;
-  pthread_mutex_unlock(&queue->lock);
-}
-
-static void *
-count_queue_worker(void *arg) {
-  count_queue_t *queue = arg;
-
-  for(;;) {
-    count_job_t *job;
-    unsigned long long total = 0;
-    size_t file_count = 0;
-    size_t dir_count = 0;
-    int ret;
-
-    pthread_mutex_lock(&queue->lock);
-    while(!queue->stopping && !queue->head) {
-      pthread_cond_wait(&queue->has_work, &queue->lock);
-    }
-    if(queue->stopping && !queue->head) {
-      pthread_mutex_unlock(&queue->lock);
-      return NULL;
-    }
-    job = queue->head;
-    queue->head = job->next;
-    if(!queue->head) {
-      queue->tail = NULL;
-    }
-    queue->queued--;
-    queue->active++;
-    pthread_cond_signal(&queue->has_space);
-    pthread_mutex_unlock(&queue->lock);
-
-    ret = count_path_bytes_sync(queue->task, job->path,
-                                job->has_display ? job->display : NULL,
-                                &total, &file_count, &dir_count);
-    if(!ret) {
-      count_queue_add(queue, total, file_count, dir_count);
-    }
-
-    pthread_mutex_lock(&queue->lock);
-    if(ret) {
-      queue->error = 1;
-      queue->error_number = errno ? errno : EIO;
-      queue->stopping = 1;
-      pthread_cond_broadcast(&queue->has_work);
-    }
-    queue->active--;
-    if(!queue->head && !queue->active) {
-      pthread_cond_broadcast(&queue->idle);
-    }
-    pthread_mutex_unlock(&queue->lock);
-    free(job);
-  }
-}
-
-static int
-count_queue_init(count_queue_t *queue, file_task_t *task) {
-  int i;
-
-  memset(queue, 0, sizeof(*queue));
-  queue->task = task;
-  if(pthread_mutex_init(&queue->lock, NULL)) {
-    return -1;
-  }
-  if(pthread_cond_init(&queue->has_work, NULL)) {
-    pthread_mutex_destroy(&queue->lock);
-    return -1;
-  }
-  if(pthread_cond_init(&queue->has_space, NULL)) {
-    pthread_cond_destroy(&queue->has_work);
-    pthread_mutex_destroy(&queue->lock);
-    return -1;
-  }
-  if(pthread_cond_init(&queue->idle, NULL)) {
-    pthread_cond_destroy(&queue->has_space);
-    pthread_cond_destroy(&queue->has_work);
-    pthread_mutex_destroy(&queue->lock);
-    return -1;
-  }
-  for(i = 0; i < SMALL_COPY_WORKERS; i++) {
-    if(pthread_create(&queue->workers[i], NULL, count_queue_worker, queue)) {
-      queue->stopping = 1;
-      pthread_cond_broadcast(&queue->has_work);
-      while(queue->worker_count > 0) {
-        pthread_join(queue->workers[--queue->worker_count], NULL);
-      }
-      pthread_cond_destroy(&queue->idle);
-      pthread_cond_destroy(&queue->has_space);
-      pthread_cond_destroy(&queue->has_work);
-      pthread_mutex_destroy(&queue->lock);
-      return -1;
-    }
-    queue->worker_count++;
-  }
-  return 0;
-}
-
-static int
-count_queue_enqueue(count_queue_t *queue, const char *path, const char *display) {
-  count_job_t *job;
-
-  if(!(job = calloc(1, sizeof(*job)))) {
-    return -1;
-  }
-  snprintf(job->path, sizeof(job->path), "%s", path);
-  if(display) {
-    snprintf(job->display, sizeof(job->display), "%s", display);
-    job->has_display = 1;
-  }
-
-  pthread_mutex_lock(&queue->lock);
-  while(!queue->stopping && queue->queued >= FILE_TASK_QUEUE_LIMIT) {
-    pthread_cond_wait(&queue->has_space, &queue->lock);
-  }
-  if(queue->stopping || queue->error || task_cancel_requested(queue->task)) {
-    pthread_mutex_unlock(&queue->lock);
-    free(job);
-    errno = queue->error_number ? queue->error_number : ECANCELED;
-    return -1;
-  }
-  if(queue->tail) {
-    queue->tail->next = job;
-  } else {
-    queue->head = job;
-  }
-  queue->tail = job;
-  queue->queued++;
-  pthread_cond_signal(&queue->has_work);
-  pthread_mutex_unlock(&queue->lock);
-  return 0;
-}
-
-static int
-count_queue_finish(count_queue_t *queue, int abort_pending) {
-  count_job_t *job;
-  int ret = abort_pending ? -1 : 0;
-  int i;
-
-  pthread_mutex_lock(&queue->lock);
-  while(!abort_pending && !queue->error && (queue->head || queue->active)) {
-    pthread_cond_wait(&queue->idle, &queue->lock);
-  }
-  if(queue->error) {
-    errno = queue->error_number ? queue->error_number : EIO;
-    ret = -1;
-  }
-  queue->stopping = 1;
-  if(abort_pending || ret) {
-    while(queue->head) {
-      job = queue->head;
-      queue->head = job->next;
-      free(job);
-    }
-    queue->tail = NULL;
-    queue->queued = 0;
-  }
-  pthread_cond_broadcast(&queue->has_work);
-  pthread_cond_broadcast(&queue->has_space);
-  pthread_mutex_unlock(&queue->lock);
-
-  for(i = 0; i < queue->worker_count; i++) {
-    pthread_join(queue->workers[i], NULL);
-  }
-  while(queue->head) {
-    job = queue->head;
-    queue->head = job->next;
-    free(job);
-  }
-  pthread_cond_destroy(&queue->idle);
-  pthread_cond_destroy(&queue->has_space);
-  pthread_cond_destroy(&queue->has_work);
-  pthread_mutex_destroy(&queue->lock);
-  return ret;
-}
-
-static int
-count_path_bytes(file_task_t *task, const char *path, const char *display,
-                 unsigned long long *total, size_t *file_count,
-                 size_t *dir_count) {
-  DIR *dir;
-  struct dirent *entry;
-  struct stat st;
-  int ret = -1;
-  int queue_finished = 0;
-  count_queue_t queue;
-
-  if(task && task_cancel_requested(task)) {
-    return -1;
-  }
-  if(lstat(path, &st)) {
-    return -1;
-  }
-  if(!S_ISDIR(st.st_mode)) {
-    return count_path_bytes_sync(task, path, display, total, file_count,
-                                 dir_count);
-  }
-  if(task) {
-    task_update(task, TASK_RUNNING, display ? display : path, 0, NULL);
-  }
-  if(dir_count) (*dir_count)++;
-  if(count_queue_init(&queue, task)) {
-    return -1;
-  }
-  if(!(dir = opendir(path))) {
-    count_queue_finish(&queue, 1);
-    return -1;
-  }
-
-  while((entry = readdir(dir))) {
-    char child[PATH_MAX];
-    char display_child[PATH_MAX];
-
-    if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) {
-      continue;
-    }
-    if(task && task_cancel_requested(task)) {
-      errno = ECANCELED;
-      goto done;
-    }
-    if(path_join(child, sizeof(child), path, entry->d_name) ||
-       (display && path_join(display_child, sizeof(display_child), display,
-                             entry->d_name)) ||
-       count_queue_enqueue(&queue, child, display ? display_child : NULL)) {
-      goto done;
-    }
-  }
-
-  ret = count_queue_finish(&queue, 0);
-  queue_finished = 1;
-  if(!ret) {
-    *total += queue.total;
-    if(file_count) {
-      *file_count += queue.file_count;
-    }
-    if(dir_count) {
-      *dir_count += queue.dir_count;
-    }
-  }
-done:
-  closedir(dir);
-  if(ret && !queue_finished) {
-    count_queue_finish(&queue, 1);
-  }
-  return ret;
-}
-#else
 #define count_path_bytes count_path_bytes_sync
-#endif
 
 int
 count_task_path_bytes(file_task_t *task, const char *path, const char *display,
@@ -712,8 +380,11 @@ open_copy_temp(const char *dst, char *temp, size_t temp_size) {
 }
 
 static int
-copy_file_buffered(file_task_t *task, const char *src, const char *dst) {
+copy_file(file_task_t *task, const char *src, const char *dst) {
   char *buf = NULL;
+  transfer_reader_t *reader = NULL;
+  struct stat st;
+  size_t buffer_size = TRANSFER_READ_BUFFER_SIZE;
   char temp[PATH_MAX] = {0};
   int in = -1;
   int out = -1;
@@ -732,27 +403,20 @@ copy_file_buffered(file_task_t *task, const char *src, const char *dst) {
   if((out = open_copy_temp(dst, temp, sizeof(temp))) < 0) {
     goto done;
   }
-  if(!(buf = malloc(COPY_BUFFER_SIZE))) {
-    errno = ENOMEM;
-    goto done;
+  if(fstat(in, &st)) goto done;
+  wfm_set_transfer_size(out, (uint64_t)st.st_size);
+  reader = transfer_reader_start(in, 0, (uint64_t)st.st_size, task);
+  if(!reader) {
+    if((uint64_t)st.st_size < buffer_size) buffer_size = st.st_size ? (size_t)st.st_size : 1;
+    if(!(buf = malloc(buffer_size))) { errno = ENOMEM; goto done; }
   }
-
-  while((n = read(in, buf, COPY_BUFFER_SIZE)) > 0) {
-    ssize_t left = n;
-    char *p = buf;
-    if(task_cancel_requested(task)) {
-      errno = ECANCELED;
-      goto done;
-    }
-    while(left > 0) {
-      ssize_t w = write(out, p, (size_t)left);
-      if(w <= 0) {
-        goto done;
-      }
-      p += w;
-      left -= w;
-      task_update(task, TASK_RUNNING, dst, (unsigned long long)w, NULL);
-    }
+  for(;;) {
+    const char *data = buf;
+    if(reader) n = transfer_reader_peek(reader, &data);
+    else { do { n = read(in, buf, buffer_size); } while(n < 0 && errno == EINTR); }
+    if(n <= 0) break;
+    if(transfer_write_all(task, out, dst, data, (size_t)n, NULL)) goto done;
+    if(reader) transfer_reader_advance(reader, (size_t)n);
   }
   if(n < 0) {
     goto done;
@@ -767,6 +431,7 @@ copy_file_buffered(file_task_t *task, const char *src, const char *dst) {
   ret = 0;
 
 done:
+  transfer_reader_close(reader);
   free(buf);
   if(in >= 0) close(in);
   if(out >= 0) {
@@ -783,214 +448,6 @@ done:
     unlink(temp);
   }
   return ret;
-}
-
-#if FILEMGR_PIPELINE_COPY
-static void
-pipeline_fail_locked(copy_pipeline_t *p, int error) {
-  p->error = 1;
-  p->done = 1;
-  p->error_number = error ? error : EIO;
-  pthread_cond_broadcast(&p->can_read);
-  pthread_cond_broadcast(&p->can_write);
-}
-
-static void *
-copy_pipeline_reader(void *arg) {
-  copy_pipeline_t *p = arg;
-
-  for(;;) {
-    int slot;
-    ssize_t n;
-
-    pthread_mutex_lock(&p->lock);
-    while(!p->error && !p->done && p->slots[p->read_index].ready) {
-      pthread_cond_wait(&p->can_read, &p->lock);
-    }
-    if(p->error || p->done || task_cancel_requested(p->task)) {
-      p->done = 1;
-      pthread_cond_broadcast(&p->can_write);
-      pthread_mutex_unlock(&p->lock);
-      return NULL;
-    }
-    slot = p->read_index;
-    p->read_index = (p->read_index + 1) % COPY_PIPELINE_SLOTS;
-    pthread_mutex_unlock(&p->lock);
-
-    n = read(p->in, p->slots[slot].data, COPY_BUFFER_SIZE);
-
-    pthread_mutex_lock(&p->lock);
-    if(n < 0) {
-      pipeline_fail_locked(p, errno);
-    } else if(n == 0) {
-      p->done = 1;
-      pthread_cond_broadcast(&p->can_write);
-    } else {
-      p->slots[slot].size = (size_t)n;
-      p->slots[slot].ready = 1;
-      pthread_cond_signal(&p->can_write);
-    }
-    pthread_mutex_unlock(&p->lock);
-  }
-}
-
-static int
-copy_file_pipeline(file_task_t *task, const char *src, const char *dst) {
-  copy_pipeline_t p;
-  pthread_t reader;
-  char temp[PATH_MAX] = {0};
-  int out = -1;
-  int ret = -1;
-  int reader_started = 0;
-  int lock_ready = 0;
-  int can_read_ready = 0;
-  int can_write_ready = 0;
-  int i;
-
-  memset(&p, 0, sizeof(p));
-  p.task = task;
-  p.in = -1;
-  task_update(task, TASK_RUNNING, dst, 0, NULL);
-
-  if(task_cancel_requested(task)) {
-    errno = ECANCELED;
-    return -1;
-  }
-  if((p.in = open(src, O_RDONLY)) < 0) {
-    goto done;
-  }
-  if((out = open_copy_temp(dst, temp, sizeof(temp))) < 0) {
-    goto done;
-  }
-  if(pthread_mutex_init(&p.lock, NULL)) {
-    errno = EAGAIN;
-    goto done;
-  }
-  lock_ready = 1;
-  if(pthread_cond_init(&p.can_read, NULL)) {
-    errno = EAGAIN;
-    goto done;
-  }
-  can_read_ready = 1;
-  if(pthread_cond_init(&p.can_write, NULL)) {
-    errno = EAGAIN;
-    goto done;
-  }
-  can_write_ready = 1;
-  for(i = 0; i < COPY_PIPELINE_SLOTS; i++) {
-    if(posix_memalign((void **)&p.slots[i].data, 4096, COPY_BUFFER_SIZE)) {
-      errno = ENOMEM;
-      goto done;
-    }
-  }
-  if(pthread_create(&reader, NULL, copy_pipeline_reader, &p)) {
-    errno = EAGAIN;
-    goto done;
-  }
-  reader_started = 1;
-
-  for(;;) {
-    int slot;
-    char *buf;
-    size_t size;
-    size_t off = 0;
-
-    pthread_mutex_lock(&p.lock);
-    while(!p.error && !p.done && !p.slots[p.write_index].ready) {
-      pthread_cond_wait(&p.can_write, &p.lock);
-    }
-    if(p.error) {
-      errno = p.error_number;
-      pthread_mutex_unlock(&p.lock);
-      goto done;
-    }
-    if(p.done && !p.slots[p.write_index].ready) {
-      pthread_mutex_unlock(&p.lock);
-      break;
-    }
-    slot = p.write_index;
-    buf = p.slots[slot].data;
-    size = p.slots[slot].size;
-    pthread_mutex_unlock(&p.lock);
-
-    while(off < size) {
-      ssize_t n;
-      if(task_cancel_requested(task)) {
-        errno = ECANCELED;
-        goto done;
-      }
-      n = write(out, buf + off, size - off);
-      if(n <= 0) {
-        if(!n) errno = EIO;
-        goto done;
-      }
-      off += (size_t)n;
-      task_update(task, TASK_RUNNING, dst, (unsigned long long)n, NULL);
-    }
-
-    pthread_mutex_lock(&p.lock);
-    p.slots[slot].ready = 0;
-    p.write_index = (p.write_index + 1) % COPY_PIPELINE_SLOTS;
-    pthread_cond_signal(&p.can_read);
-    pthread_mutex_unlock(&p.lock);
-  }
-
-  if(fchmod_0777(out)) {
-    goto done;
-  }
-  if(task_cancel_requested(task)) {
-    errno = ECANCELED;
-    goto done;
-  }
-  ret = 0;
-
-done:
-  if(reader_started) {
-    pthread_mutex_lock(&p.lock);
-    p.done = 1;
-    p.error = 1;
-    pthread_cond_broadcast(&p.can_read);
-    pthread_cond_broadcast(&p.can_write);
-    pthread_mutex_unlock(&p.lock);
-    pthread_join(reader, NULL);
-  }
-  for(i = 0; i < COPY_PIPELINE_SLOTS; i++) {
-    free(p.slots[i].data);
-  }
-  if(can_write_ready) pthread_cond_destroy(&p.can_write);
-  if(can_read_ready) pthread_cond_destroy(&p.can_read);
-  if(lock_ready) pthread_mutex_destroy(&p.lock);
-  if(p.in >= 0) close(p.in);
-  if(out >= 0) {
-    if(close(out)) ret = -1;
-  }
-  if(!ret && task_cancel_requested(task)) {
-    errno = ECANCELED;
-    ret = -1;
-  }
-  if(!ret && rename(temp, dst)) {
-    ret = -1;
-  }
-  if(ret && temp[0]) {
-    unlink(temp);
-  }
-  return ret;
-}
-#endif
-
-static int
-copy_file(file_task_t *task, const char *src, const char *dst) {
-#if FILEMGR_PIPELINE_COPY
-  struct stat st;
-
-  if(lstat(src, &st)) {
-    return -1;
-  }
-  if(st.st_size >= LARGE_FILE_THRESHOLD) {
-    return copy_file_pipeline(task, src, dst);
-  }
-#endif
-  return copy_file_buffered(task, src, dst);
 }
 
 static int copy_path(file_task_t *task, const char *src, const char *dst);
@@ -1093,263 +550,6 @@ finish_copied_move(file_task_t *task, const char *src) {
   return ret;
 }
 
-#if FILEMGR_AGGRESSIVE_COPY
-static int copy_dir_queued(file_task_t *task, const char *src, const char *dst,
-                           copy_queue_t *queue);
-
-static void *
-copy_queue_worker(void *arg) {
-  copy_queue_t *queue = arg;
-
-  for(;;) {
-    copy_job_t *job;
-    int ret;
-
-    pthread_mutex_lock(&queue->lock);
-    while(!queue->stopping && !queue->head) {
-      pthread_cond_wait(&queue->has_work, &queue->lock);
-    }
-    if(queue->stopping && !queue->head) {
-      pthread_mutex_unlock(&queue->lock);
-      return NULL;
-    }
-    job = queue->head;
-    queue->head = job->next;
-    if(!queue->head) {
-      queue->tail = NULL;
-    }
-    queue->queued--;
-    queue->active++;
-    pthread_cond_signal(&queue->has_space);
-    pthread_mutex_unlock(&queue->lock);
-
-    ret = task_cancel_requested(queue->task) ? -1 :
-      copy_file_buffered(queue->task, job->src, job->dst);
-    if(ret && task_cancel_requested(queue->task)) {
-      errno = ECANCELED;
-    }
-
-    pthread_mutex_lock(&queue->lock);
-    if(ret) {
-      queue->error = 1;
-      queue->error_number = errno ? errno : EIO;
-      queue->stopping = 1;
-      pthread_cond_broadcast(&queue->has_work);
-      pthread_cond_broadcast(&queue->has_space);
-    }
-    queue->active--;
-    if(!queue->head && !queue->active) {
-      pthread_cond_broadcast(&queue->idle);
-    }
-    pthread_mutex_unlock(&queue->lock);
-    free(job);
-  }
-}
-
-static int
-copy_queue_init(copy_queue_t *queue, file_task_t *task) {
-  int i;
-
-  memset(queue, 0, sizeof(*queue));
-  queue->task = task;
-  if(pthread_mutex_init(&queue->lock, NULL)) {
-    return -1;
-  }
-  if(pthread_cond_init(&queue->has_work, NULL)) {
-    pthread_mutex_destroy(&queue->lock);
-    return -1;
-  }
-  if(pthread_cond_init(&queue->has_space, NULL)) {
-    pthread_cond_destroy(&queue->has_work);
-    pthread_mutex_destroy(&queue->lock);
-    return -1;
-  }
-  if(pthread_cond_init(&queue->idle, NULL)) {
-    pthread_cond_destroy(&queue->has_space);
-    pthread_cond_destroy(&queue->has_work);
-    pthread_mutex_destroy(&queue->lock);
-    return -1;
-  }
-  for(i = 0; i < SMALL_COPY_WORKERS; i++) {
-    if(pthread_create(&queue->workers[i], NULL, copy_queue_worker, queue)) {
-      queue->stopping = 1;
-      pthread_cond_broadcast(&queue->has_work);
-      while(queue->worker_count > 0) {
-        pthread_join(queue->workers[--queue->worker_count], NULL);
-      }
-      pthread_cond_destroy(&queue->idle);
-      pthread_cond_destroy(&queue->has_space);
-      pthread_cond_destroy(&queue->has_work);
-      pthread_mutex_destroy(&queue->lock);
-      return -1;
-    }
-    queue->worker_count++;
-  }
-  return 0;
-}
-
-static int
-copy_queue_enqueue(copy_queue_t *queue, const char *src, const char *dst) {
-  copy_job_t *job;
-
-  if(!(job = calloc(1, sizeof(*job)))) {
-    return -1;
-  }
-  snprintf(job->src, sizeof(job->src), "%s", src);
-  snprintf(job->dst, sizeof(job->dst), "%s", dst);
-
-  pthread_mutex_lock(&queue->lock);
-  while(!queue->stopping && queue->queued >= FILE_TASK_QUEUE_LIMIT) {
-    pthread_cond_wait(&queue->has_space, &queue->lock);
-  }
-  if(queue->stopping || queue->error || task_cancel_requested(queue->task)) {
-    pthread_mutex_unlock(&queue->lock);
-    free(job);
-    errno = queue->error_number ? queue->error_number : ECANCELED;
-    return -1;
-  }
-  if(queue->tail) {
-    queue->tail->next = job;
-  } else {
-    queue->head = job;
-  }
-  queue->tail = job;
-  queue->queued++;
-  pthread_cond_signal(&queue->has_work);
-  pthread_mutex_unlock(&queue->lock);
-  return 0;
-}
-
-static int
-copy_queue_wait(copy_queue_t *queue) {
-  int ret = 0;
-
-  pthread_mutex_lock(&queue->lock);
-  while(!queue->error && (queue->head || queue->active)) {
-    pthread_cond_wait(&queue->idle, &queue->lock);
-  }
-  if(queue->error) {
-    errno = queue->error_number ? queue->error_number : EIO;
-    ret = -1;
-  }
-  pthread_mutex_unlock(&queue->lock);
-  return ret;
-}
-
-static int
-copy_queue_finish(copy_queue_t *queue, int abort_pending) {
-  copy_job_t *job;
-  int ret = abort_pending ? -1 : copy_queue_wait(queue);
-  int i;
-
-  pthread_mutex_lock(&queue->lock);
-  queue->stopping = 1;
-  if(abort_pending) {
-    while(queue->head) {
-      job = queue->head;
-      queue->head = job->next;
-      free(job);
-    }
-    queue->tail = NULL;
-    queue->queued = 0;
-  }
-  pthread_cond_broadcast(&queue->has_work);
-  pthread_cond_broadcast(&queue->has_space);
-  pthread_mutex_unlock(&queue->lock);
-  for(i = 0; i < queue->worker_count; i++) {
-    pthread_join(queue->workers[i], NULL);
-  }
-  while(queue->head) {
-    job = queue->head;
-    queue->head = job->next;
-    free(job);
-  }
-  pthread_cond_destroy(&queue->idle);
-  pthread_cond_destroy(&queue->has_space);
-  pthread_cond_destroy(&queue->has_work);
-  pthread_mutex_destroy(&queue->lock);
-  return ret;
-}
-
-static int
-copy_dir(file_task_t *task, const char *src, const char *dst) {
-  copy_queue_t queue;
-  int ret;
-
-  if(copy_queue_init(&queue, task)) {
-    return -1;
-  }
-  ret = copy_dir_queued(task, src, dst, &queue);
-  if(copy_queue_finish(&queue, ret)) {
-    ret = -1;
-  }
-  return ret;
-}
-
-static int
-copy_dir_queued(file_task_t *task, const char *src, const char *dst,
-                copy_queue_t *queue) {
-  DIR *dir;
-  struct dirent *entry;
-  struct stat st;
-  int ret = -1;
-
-  task_update(task, TASK_RUNNING, dst, 0, NULL);
-
-  if(task_cancel_requested(task)) {
-    return -1;
-  }
-  if(ensure_copy_dir(dst)) {
-    return -1;
-  }
-  if(!(dir = opendir(src))) {
-    return -1;
-  }
-
-  while((entry = readdir(dir))) {
-    char from[PATH_MAX];
-    char to[PATH_MAX];
-
-    if(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) {
-      continue;
-    }
-    if(task_cancel_requested(task)) {
-      goto done;
-    }
-    if(path_join(from, sizeof(from), src, entry->d_name) ||
-       path_join(to, sizeof(to), dst, entry->d_name)) {
-      goto done;
-    }
-    if(lstat(from, &st)) {
-      goto done;
-    }
-    if(S_ISDIR(st.st_mode)) {
-      if(copy_dir_queued(task, from, to, queue)) {
-        goto done;
-      }
-    } else if(S_ISREG(st.st_mode)) {
-#if FILEMGR_PIPELINE_COPY
-      if(st.st_size >= LARGE_FILE_THRESHOLD) {
-        if(copy_queue_wait(queue) || copy_file_pipeline(task, from, to)) {
-          goto done;
-        }
-      } else
-#endif
-      if(copy_queue_enqueue(queue, from, to)) {
-        goto done;
-      }
-    } else {
-      errno = ENOTSUP;
-      goto done;
-    }
-  }
-
-  ret = 0;
-done:
-  closedir(dir);
-  return ret;
-}
-#else
 static int
 copy_dir(file_task_t *task, const char *src, const char *dst) {
   DIR *dir;
@@ -1390,7 +590,6 @@ done:
   closedir(dir);
   return ret;
 }
-#endif
 
 static int
 copy_path(file_task_t *task, const char *src, const char *dst) {
@@ -2721,6 +1920,16 @@ filemgr_api_request(struct MHD_Connection *conn, const char *url,
   if(!strcmp(url, "/api/list")) return api_list(conn);
   if(!strcmp(url, "/api/tasks")) return api_tasks(conn);
   if(!strcmp(url, "/api/space")) return api_space(conn);
+  if(!strcmp(url, "/api/smb/add") || !strcmp(url, "/api/smb/connect")) {
+    return strcmp(method, MHD_HTTP_METHOD_POST) ?
+      send_json_error(conn, MHD_HTTP_METHOD_NOT_ALLOWED, "invalid method") :
+      api_smb_add(conn, body, body_size, !strcmp(url, "/api/smb/connect"));
+  }
+  if(!strcmp(url, "/api/smb/remove")) {
+    return strcmp(method, MHD_HTTP_METHOD_POST) ?
+      send_json_error(conn, MHD_HTTP_METHOD_NOT_ALLOWED, "invalid method") :
+      api_smb_remove(conn, body, body_size);
+  }
   if(!strcmp(url, "/api/cancel")) return api_cancel(conn);
   if(!strcmp(url, "/api/exit")) return api_exit(conn);
   if(!strcmp(url, "/api/copy")) return api_copy(conn, body, body_size);

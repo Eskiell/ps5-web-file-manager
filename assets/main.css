@@ -73,6 +73,7 @@ body {
 .top-right {
   flex: 0 1 auto;
   min-width: 0;
+  max-width: 100%;
   margin-left: auto;
   justify-content: flex-end;
   flex-wrap: wrap;
@@ -84,7 +85,7 @@ body {
   color: #aab4be;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 22px;
-  line-height: 24px;
+  line-height: 30px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -94,6 +95,7 @@ body {
 }
 
 .space-info {
+  min-width: 0;
   height: auto;
   min-height: 0;
   display: flex;
@@ -110,43 +112,52 @@ body {
   text-align: right;
 }
 
-.space-info .space-item {
+.top-right .space-add {
   flex: 0 0 auto;
-  display: inline-flex;
+  height: 30px;
+  min-height: 30px;
+  min-width: 0;
+  margin-right: 14px;
+  padding: 0 8px;
+  border-radius: 3px;
+  font-size: 18px;
+}
+
+.space-info .space-select {
+  -webkit-appearance: menulist-button;
+  color-scheme: dark;
+  flex: 0 0 auto;
+  width: 360px;
   height: auto;
   min-height: 0;
   min-width: 0;
   margin-left: 14px;
-  padding: 0 2px;
-  border: 0;
+  padding: 2px 6px;
+  border: 1px solid #2d343d;
   border-radius: 3px;
-  background: transparent;
+  background: #1b2026;
   color: inherit;
   font: inherit;
   line-height: inherit;
-  text-align: right;
+  text-align: left;
   cursor: pointer;
-  max-width: 100%;
+  max-width: calc(100% - 50px);
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.space-info .space-item:hover:not(:disabled),
-.space-info .space-item:focus:not(:disabled) {
+.space-info .space-select:hover:not(:disabled),
+.space-info .space-select:focus:not(:disabled) {
   color: #fff;
-  background: rgba(255, 255, 255, 0.1);
+  background: #2d343d;
   outline: none;
 }
 
-.space-info .space-item:focus-visible {
+.space-info .space-select:focus {
   box-shadow: 0 0 0 2px #87bfff;
 }
 
-.space-info .space-item:active {
-  background: rgba(255, 255, 255, 0.18);
-}
-
-.space-info .space-item:disabled {
+.space-info .space-select:disabled {
   opacity: 1;
   color: inherit;
   cursor: default;
@@ -156,11 +167,6 @@ body {
 .space-prefix {
   color: #8f9aa5;
   flex: 0 0 auto;
-}
-
-.space-info .space-item.current {
-  color: #f2f5f7;
-  font-weight: 700;
 }
 
 .icon-button {
@@ -643,7 +649,7 @@ th.size-col {
 }
 
 .mode-col {
-  width: 100px;
+  width: 140px;
   text-align: center;
 }
 
@@ -991,6 +997,48 @@ input[type="checkbox"] {
   color: #edf0f2;
   font-size: 26px;
   font-weight: 600;
+}
+
+.smb-manager-panel {
+  max-height: calc(100vh - 96px);
+  display: flex;
+  flex-direction: column;
+}
+
+.smb-connection-list {
+  overflow-y: auto;
+  min-height: 0;
+  margin: 20px 0;
+}
+
+.smb-connection-row {
+  display: flex;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid #2d343d;
+}
+
+.smb-connection-path {
+  flex: 1 1 0;
+  min-width: 0;
+  color: #c9d3dc;
+  overflow-wrap: break-word;
+  word-break: break-all;
+}
+
+.smb-connection-row button {
+  flex: 0 0 auto;
+  margin-left: 16px;
+  padding: 6px 12px;
+}
+
+.smb-connections-empty {
+  padding: 16px 0;
+  color: #8f9aa5;
+}
+
+.smb-manager-panel .permission-actions {
+  flex: 0 0 auto;
 }
 
 .permission-path {
@@ -1410,11 +1458,24 @@ input[type="checkbox"] {
 
 @media (max-width: 815px) {
   .top-left {
+    flex: 0 0 100%;
     padding: 0 40px 0 0;
   }
 
   .top-right {
+    flex: 1 1 100%;
+    width: 100%;
+    margin-left: 0;
+    justify-content: flex-start;
     padding: 10px 0;
+  }
+
+  .space-info {
+    flex-wrap: nowrap;
+  }
+
+  .space-info .space-select {
+    flex: 1 1 auto;
   }
 }
 
@@ -1427,17 +1488,45 @@ input[type="checkbox"] {
     min-height: 42px;
     padding: 0 10px;
     align-items: center;
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
   }
 
   .top-left {
-    flex: 1 1 auto;
+    flex: 0 0 100%;
     margin-top: 0;
     padding-right: 34px;
   }
 
   .top-right {
-    display: none;
+    display: flex;
+    flex-wrap: wrap;
+    padding: 0 0 10px;
+    align-items: flex-end;
+  }
+
+  .top-right .space-add {
+    margin-right: 8px;
+    padding: 0 6px;
+    font-size: 14px;
+  }
+
+  .space-info {
+    flex: 1 1 0;
+    flex-direction: row;
+    align-items: center;
+    font-size: 14px;
+    line-height: 24px;
+  }
+
+  .space-prefix {
+    text-align: left;
+  }
+
+  .space-info .space-select {
+    flex: 1 1 auto;
+    width: 360px;
+    max-width: 100%;
+    margin-left: 8px;
   }
 
   .path {
@@ -1675,5 +1764,11 @@ input[type="checkbox"] {
 
   .task .danger {
     width: 100%;
+  }
+}
+
+@media (max-width: 359px) {
+  .space-info {
+    font-size: 13px;
   }
 }
