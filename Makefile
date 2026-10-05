@@ -45,7 +45,7 @@ ASSETS      := $(filter-out assets/icon0.png,$(BASE_ASSETS))
 endif
 GEN_SRCS    := $(patsubst assets/%,gen/%, $(ASSETS:=.c))
 
-CFLAGS := -Oz -fno-asynchronous-unwind-tables -fno-unwind-tables -Wall -Werror -ffunction-sections -fdata-sections -Isrc -DVERSION_TAG=\"$(VERSION_TAG)\" -DTITLE_ID=\"$(TITLE_ID)\"
+CFLAGS := -Oz -flto=thin -fno-asynchronous-unwind-tables -fno-unwind-tables -Wall -Werror -ffunction-sections -fdata-sections -Isrc -DVERSION_TAG=\"$(VERSION_TAG)\" -DTITLE_ID=\"$(TITLE_ID)\"
 CFLAGS += `$(PKG_CONFIG) libmicrohttpd --cflags`
 CFLAGS += -DWFM_DEBUG=$(PS5_DEBUG)
 CFLAGS += -Ivendor/libsmb2/include
@@ -117,5 +117,6 @@ $(SMB2_PS5_LIB): .build-smb2/ps5/source.stamp
 	  -DCMAKE_C_COMPILER="$(PS5_PAYLOAD_SDK)/bin/prospero-clang" \
 	  -DCMAKE_AR="$(PS5_PAYLOAD_SDK)/bin/prospero-ar" \
 	  -DCMAKE_RANLIB="$(PS5_PAYLOAD_SDK)/bin/prospero-ranlib" \
-	  '-DCMAKE_C_FLAGS=-Oz -ffunction-sections -fdata-sections'
+	  '-DCMAKE_C_FLAGS=-flto=thin -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables' \
+	  '-DCMAKE_C_FLAGS_RELEASE=-Oz -DNDEBUG'
 	$(CMAKE) --build .build-smb2/ps5/build --target smb2 --parallel 4
