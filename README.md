@@ -124,7 +124,8 @@ On first startup the payload installs a `PS5 Web File Manager` web shortcut in t
 
 This project was built with reference to these projects:
 
-- **[ps5-payload-dev/websrv](https://github.com/ps5-payload-dev/websrv):** HTTP server structure, static asset embedding ideas, PS5 browser/websrv behavior and PKG install function. License: GPLv3+.
+- **[ps5-payload-dev/websrv](https://github.com/ps5-payload-dev/websrv):** HTTP server structure, static asset embedding ideas, PS5 browser/websrv behavior and PKG install function. SMB connection/authentication and SMB PKG installation reference. License: GPLv3+.
+- **[itsPLK/ps5-pkg-manager](https://github.com/itsPLK/ps5-pkg-manager):** HTTP PKG streaming, byte-range handling and installation metadata/icon URL reference. License: GPLv3.
 - **[ps5-payload-dev/ftpsrv](https://github.com/ps5-payload-dev/ftpsrv):** PS5 payload conventions, home screen launcher/install flow reference, process handling style and startup installation reference. License: GPLv3+.
 - **[seregonwar/zftpd](https://github.com/seregonwar/zftpd):** PS5 TCP socket buffer tuning and high-throughput transfer behavior reference. License: MIT.
 - **[itsPLK/ps5-payload-manager](https://github.com/itsPLK/ps5-payload-manager):** Payload building behavior. License: GPLv3.
